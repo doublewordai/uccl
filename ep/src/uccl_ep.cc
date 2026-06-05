@@ -24,6 +24,7 @@
 #include <nanobind/stl/vector.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <map>

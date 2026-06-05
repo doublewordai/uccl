@@ -97,7 +97,7 @@ def test_main(
         args.num_experts,
     )
 
-    assert num_experts % num_ranks == 0 and num_local_ranks == 8
+    assert num_experts % num_ranks == 0 and num_local_ranks in (4, 8)
     if local_rank == 0:
         print(
             f"[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}",
@@ -394,6 +394,10 @@ def test_main(
                         ), f"{calc_diff(check_topk_weights, ref_topk_weights)}"
 
                     hash_value += hash_tensor(recv_x)
+                    if getattr(args, "smoke_one", False):
+                        if local_rank == 0:
+                            print("[testing] smoke-one complete", flush=True)
+                        return hash_value
 
                     # For later tuning
                     dispatch_bf16_rdma_send_bytes = num_rdma_token_sent * hidden * 2
@@ -409,6 +413,24 @@ def test_main(
     # Tune dispatch performance
     best_dispatch_results = None
     fp8_factor = (1 + 4 / 128) / 2
+    fixed_dispatch = (
+        args.fixed_dispatch_nvl_chunk is not None
+        or args.fixed_dispatch_rdma_chunk is not None
+    )
+    if fixed_dispatch:
+        if (
+            args.fixed_dispatch_nvl_chunk is None
+            or args.fixed_dispatch_rdma_chunk is None
+        ):
+            raise ValueError(
+                "--fixed-dispatch-nvl-chunk and --fixed-dispatch-rdma-chunk must be set together"
+            )
+        dispatch_nvl_chunks = (args.fixed_dispatch_nvl_chunk,)
+        dispatch_rdma_chunks = (args.fixed_dispatch_rdma_chunk,)
+    else:
+        dispatch_nvl_chunks = range(4, 45, 4)
+        dispatch_rdma_chunks = range(4, 129, 8)
+
     for current_x in (x_e4m3, x):
         best_time, best_results = 1e10, None
         rdma_send_bytes = (
@@ -421,8 +443,8 @@ def test_main(
             if isinstance(current_x, tuple)
             else dispatch_bf16_nvl_recv_bytes
         )
-        for nvl_chunk_size in range(4, 45, 4):
-            for rdma_chunk_size in range(4, 33, 4):
+        for nvl_chunk_size in dispatch_nvl_chunks:
+            for rdma_chunk_size in dispatch_rdma_chunks:
                 config = Config(
                     num_sms,
                     nvl_chunk_size,
@@ -431,9 +453,13 @@ def test_main(
                     rdma_buffer_size,
                 )
                 tune_args = {"x": current_x, "handle": handle, "config": config}
+                os.environ["UCCL_CXI_PHASE"] = (
+                    "dispatch_fp8" if isinstance(current_x, tuple) else "dispatch_bf16"
+                )
                 t, notify_t = bench_kineto(
                     lambda: buffer.dispatch(**tune_args), ("dispatch", "notify")
                 )
+                os.environ.pop("UCCL_CXI_PHASE", None)
                 if t == 0 or notify_t == 0:
                     continue
                 if t < best_time:
@@ -486,12 +512,29 @@ def test_main(
         "num_tokens_per_expert": num_tokens_per_expert,
         "config": dispatch_config if dispatch_config is not None else config,
     }
+    os.environ["UCCL_CXI_PHASE"] = "dispatch_final"
     recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
+    os.environ.pop("UCCL_CXI_PHASE", None)
 
     # Tune combine performance
+    fixed_combine = (
+        args.fixed_combine_nvl_chunk is not None
+        or args.fixed_combine_rdma_chunk is not None
+    )
+    if fixed_combine:
+        if args.fixed_combine_nvl_chunk is None or args.fixed_combine_rdma_chunk is None:
+            raise ValueError(
+                "--fixed-combine-nvl-chunk and --fixed-combine-rdma-chunk must be set together"
+            )
+        combine_nvl_chunks = (args.fixed_combine_nvl_chunk,)
+        combine_rdma_chunks = (args.fixed_combine_rdma_chunk,)
+    else:
+        combine_nvl_chunks = range(1, 8, 1)
+        combine_rdma_chunks = range(12 if num_nodes == 2 else 8, 33, 4)
+
     best_time, best_results = 1e10, None
-    for nvl_chunk_size in range(1, 8, 1):
-        for rdma_chunk_size in range(12 if num_nodes == 2 else 8, 33, 4):
+    for nvl_chunk_size in combine_nvl_chunks:
+        for rdma_chunk_size in combine_rdma_chunks:
             config = Config(
                 num_sms,
                 nvl_chunk_size,
@@ -500,9 +543,11 @@ def test_main(
                 rdma_buffer_size,
             )
             tune_args = {"x": recv_x, "handle": handle, "config": config}
+            os.environ["UCCL_CXI_PHASE"] = "combine"
             t, notify_t = bench_kineto(
                 lambda: buffer.combine(**tune_args), ("combine", "notify")
             )
+            os.environ.pop("UCCL_CXI_PHASE", None)
             if t == 0 or notify_t == 0:
                 continue
             if local_rank == 0:
@@ -567,7 +612,7 @@ def test_loop(
         explicitly_destroy=True,
     )
 
-    assert num_local_ranks == 8 and num_ranks > 8
+    assert num_local_ranks in (4, 8) and num_ranks > num_local_ranks
 
     for seed in range(int(1e9)):
         if local_rank == 0:
@@ -658,6 +703,35 @@ if __name__ == "__main__":
         "--test-ll-compatibility",
         action="store_true",
         help="whether to test compatibility with low-latency kernels",
+    )
+    parser.add_argument(
+        "--smoke-one",
+        action="store_true",
+        help="run only the first dispatch/combine correctness variant",
+    )
+    parser.add_argument(
+        "--fixed-dispatch-nvl-chunk",
+        type=int,
+        default=None,
+        help="benchmark only this dispatch NVL chunk size",
+    )
+    parser.add_argument(
+        "--fixed-dispatch-rdma-chunk",
+        type=int,
+        default=None,
+        help="benchmark only this dispatch RDMA chunk size",
+    )
+    parser.add_argument(
+        "--fixed-combine-nvl-chunk",
+        type=int,
+        default=None,
+        help="benchmark only this combine NVL chunk size",
+    )
+    parser.add_argument(
+        "--fixed-combine-rdma-chunk",
+        type=int,
+        default=None,
+        help="benchmark only this combine RDMA chunk size",
     )
     args = parser.parse_args()
     world_size = int(os.environ["WORLD_SIZE"])

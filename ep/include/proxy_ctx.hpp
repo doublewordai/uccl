@@ -1,9 +1,13 @@
 #pragma once
 #include "barrier_local.hpp"
+#ifdef USE_CXI
+#include "cxi_transport.hpp"
+#endif
 #include "util/gpu_rt.h"
 #include <infiniband/verbs.h>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -89,6 +93,17 @@ struct ProxyCtx {
   uint64_t remote_len = 0;
   uint32_t remote_rkey = 0;
   uint32_t rkey = 0;
+
+#ifdef USE_CXI
+  std::unique_ptr<uccl::cxi::Transport> cxi_transport;
+  void* cxi_local_base = nullptr;
+  uint64_t cxi_local_len = 0;
+  fi_addr_t cxi_peer_addr = FI_ADDR_UNSPEC;
+  uint64_t cxi_remote_key = 0;
+  uint64_t cxi_remote_len = 0;
+  uint64_t cxi_remote_host_key = 0;
+  uint64_t cxi_remote_host_len = 0;
+#endif
 
 #ifdef USE_DMABUF
   // Chunked MR support — populated when the GPU buffer exceeds the per-MR

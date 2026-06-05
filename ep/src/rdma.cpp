@@ -28,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <fcntl.h>
@@ -391,6 +392,22 @@ bool is_cuda_host_pointer(void* ptr) {
 
 void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
                           int thread_idx, int local_rank) {
+#ifdef USE_CXI
+  if (S.cxi_transport) return;
+  (void)rank;
+  (void)thread_idx;
+  cudaSetDevice(local_rank);
+  S.cxi_transport = std::make_unique<uccl::cxi::Transport>();
+  S.cxi_transport->init(local_rank % 4);
+  S.cxi_transport->register_cuda_buffer(gpu_buf, bytes);
+  S.cxi_local_base = gpu_buf;
+  S.cxi_local_len = bytes;
+  S.remote_addr = 0;
+  S.remote_len = bytes;
+  S.numa_node = 0;
+  return;
+#endif
+
   if (S.context) return;  // already initialized
 
   int num_devices = 0;
@@ -981,6 +998,36 @@ void create_per_thread_qp(ProxyCtx& S, void* gpu_buffer, size_t size,
                           RDMAConnectionInfo* local_info, int rank,
                           size_t num_rings, bool use_normal_mode,
                           void* atomic_buffer_ptr) {
+#ifdef USE_CXI
+  (void)gpu_buffer;
+  (void)rank;
+  (void)num_rings;
+  (void)use_normal_mode;
+  if (!S.cxi_transport) {
+    fprintf(stderr, "CXI transport is not initialized\n");
+    std::abort();
+  }
+  if (atomic_buffer_ptr) {
+    S.cxi_transport->register_host_buffer(atomic_buffer_ptr, kAtomicBufferSize);
+  }
+  auto info = S.cxi_transport->local_info();
+  if (info.ep_name.size() > sizeof(local_info->cxi_ep_name)) {
+    fprintf(stderr, "CXI endpoint name too large: %zu > %zu\n",
+            info.ep_name.size(), sizeof(local_info->cxi_ep_name));
+    std::abort();
+  }
+  local_info->addr = 0;
+  local_info->len = size;
+  local_info->cxi_mr_key = info.mr_key;
+  local_info->cxi_mr_len = info.size;
+  local_info->cxi_host_mr_key = info.host_mr_key;
+  local_info->cxi_host_mr_len = info.host_size;
+  local_info->cxi_ep_name_len = static_cast<uint32_t>(info.ep_name.size());
+  std::memcpy(local_info->cxi_ep_name, info.ep_name.data(),
+              info.ep_name.size());
+  return;
+#endif
+
   if (S.qp) return;  // Already initialized for this thread
   if (S.ack_qp) return;
   if (S.recv_ack_qp) return;
@@ -1100,7 +1147,7 @@ void create_per_thread_qp(ProxyCtx& S, void* gpu_buffer, size_t size,
 }
 
 void modify_qp_to_init(ProxyCtx& S) {
-#ifdef EFA
+#if defined(EFA) || defined(USE_CXI)
   return;
 #endif
   struct ibv_qp_attr attr;
@@ -1168,6 +1215,27 @@ struct ibv_ah* create_ah(ProxyCtx& S, uint8_t* remote_gid) {
 
 void modify_qp_to_rtr(ProxyCtx& S, RDMAConnectionInfo* remote,
                       bool use_normal_mode) {
+#ifdef USE_CXI
+  (void)use_normal_mode;
+  if (!S.cxi_transport) {
+    fprintf(stderr, "CXI transport is not initialized for peer\n");
+    std::abort();
+  }
+  uccl::cxi::EndpointInfo peer_info;
+  peer_info.mr_key = remote->cxi_mr_key;
+  peer_info.size = remote->cxi_mr_len;
+  peer_info.host_mr_key = remote->cxi_host_mr_key;
+  peer_info.host_size = remote->cxi_host_mr_len;
+  peer_info.ep_name.assign(remote->cxi_ep_name,
+                           remote->cxi_ep_name + remote->cxi_ep_name_len);
+  S.cxi_peer_addr = S.cxi_transport->insert_peer(peer_info);
+  S.cxi_remote_key = remote->cxi_mr_key;
+  S.cxi_remote_len = remote->cxi_mr_len;
+  S.cxi_remote_host_key = remote->cxi_host_mr_key;
+  S.cxi_remote_host_len = remote->cxi_host_mr_len;
+  return;
+#endif
+
 #ifdef EFA
   S.dst_qpn = remote->qp_num;
   S.dst_ack_qpn = remote->recv_ack_qp_num;
@@ -1303,6 +1371,12 @@ void modify_qp_to_rtr(ProxyCtx& S, RDMAConnectionInfo* remote,
 }
 
 void modify_qp_to_rts(ProxyCtx& S, RDMAConnectionInfo* local_info) {
+#ifdef USE_CXI
+  (void)S;
+  (void)local_info;
+  return;
+#endif
+
 #ifdef EFA
   return;
 #endif
@@ -1384,6 +1458,177 @@ void post_receive_buffer_for_imm(ProxyCtx& S) {
 }
 
 // Normal mode implementation
+#ifdef USE_CXI
+struct CxiPlannedWrite {
+  uccl::cxi::Transport* transport = nullptr;
+  ProxyCtx* ctx = nullptr;
+  fi_addr_t peer = FI_ADDR_UNSPEC;
+  void* local = nullptr;
+  uint64_t local_offset = 0;
+  uint64_t remote_offset = 0;
+  uint64_t remote_key = 0;
+  size_t bytes = 0;
+};
+
+static void maybe_print_cxi_write_stats(
+    int my_rank, std::vector<uint64_t> const& wrs_to_post,
+    std::vector<TransferCmd> const& cmds_to_post,
+    std::vector<CxiPlannedWrite> const& writes,
+    std::unordered_map<uccl::cxi::Transport*,
+                       std::vector<uccl::cxi::WriteContext*>> const&
+        pending_by_transport) {
+  static bool const enabled = std::getenv("UCCL_CXI_STATS") != nullptr;
+  if (!enabled || cmds_to_post.empty()) return;
+
+  size_t total_bytes = 0;
+  size_t min_bytes = SIZE_MAX;
+  size_t max_bytes = 0;
+  size_t dispatch_cmds = 0;
+  size_t combine_cmds = 0;
+  std::array<size_t, 8> buckets{};
+  for (auto const& cmd : cmds_to_post) {
+    if (get_is_combine(cmd.cmd_type)) {
+      ++combine_cmds;
+    } else {
+      ++dispatch_cmds;
+    }
+  }
+  for (auto const& write : writes) {
+    total_bytes += write.bytes;
+    min_bytes = std::min(min_bytes, write.bytes);
+    max_bytes = std::max(max_bytes, write.bytes);
+    size_t bucket = 0;
+    size_t n = std::max<size_t>(1, write.bytes);
+    while (n > 4096 && bucket + 1 < buckets.size()) {
+      n >>= 1;
+      ++bucket;
+    }
+    ++buckets[bucket];
+  }
+  if (writes.empty()) min_bytes = 0;
+
+  static std::atomic<uint64_t> seq{0};
+  uint64_t const id = seq.fetch_add(1, std::memory_order_relaxed);
+  char const* phase = std::getenv("UCCL_CXI_PHASE");
+  if (!phase) phase = "unset";
+  fprintf(stderr,
+          "[CXI_STATS] id=%llu rank=%d phase=%s kind=%s cmds=%zu dispatch_cmds=%zu "
+          "combine_cmds=%zu writes=%zu bytes=%zu min=%zu max=%zu "
+          "avg=%.1f coalesced=%.2f transports=%zu buckets_le4k=%zu "
+          "le8k=%zu le16k=%zu le32k=%zu le64k=%zu le128k=%zu le256k=%zu "
+          "gt256k=%zu\n",
+          (unsigned long long)id, my_rank, phase,
+          combine_cmds != 0 && dispatch_cmds == 0 ? "combine" : "dispatch",
+          wrs_to_post.size(), dispatch_cmds, combine_cmds, writes.size(),
+          total_bytes, min_bytes, max_bytes,
+          writes.empty() ? 0.0
+                         : static_cast<double>(total_bytes) /
+                               static_cast<double>(writes.size()),
+          writes.empty()
+              ? 0.0
+              : static_cast<double>(cmds_to_post.size()) /
+                    static_cast<double>(writes.size()),
+          pending_by_transport.size(), buckets[0], buckets[1], buckets[2],
+          buckets[3], buckets[4], buckets[5], buckets[6], buckets[7]);
+}
+
+static void post_rdma_async_batched_cxi(
+    std::vector<uint64_t> const& wrs_to_post,
+    std::vector<TransferCmd> const& cmds_to_post,
+    std::vector<std::unique_ptr<ProxyCtx>>& ctxs, int my_rank,
+    bool use_normal_mode) {
+  std::vector<CxiPlannedWrite> writes;
+  writes.reserve(cmds_to_post.size());
+
+  auto append_write = [&writes](uccl::cxi::Transport* transport, ProxyCtx* ctx,
+                                fi_addr_t peer, void* local,
+                                uint64_t local_offset,
+                                uint64_t remote_offset, uint64_t remote_key,
+                                size_t bytes) {
+    if (!writes.empty()) {
+      auto& prev = writes.back();
+      uintptr_t const prev_local_end =
+          reinterpret_cast<uintptr_t>(prev.local) + prev.bytes;
+      if (prev.transport == transport && prev.ctx == ctx && prev.peer == peer &&
+          prev.remote_key == remote_key &&
+          prev.local_offset + prev.bytes == local_offset &&
+          prev.remote_offset + prev.bytes == remote_offset &&
+          prev_local_end == reinterpret_cast<uintptr_t>(local)) {
+        prev.bytes += bytes;
+        return;
+      }
+    }
+    writes.push_back(CxiPlannedWrite{transport, ctx, peer, local, local_offset,
+                                     remote_offset, remote_key, bytes});
+  };
+
+  for (size_t i = 0; i < wrs_to_post.size(); ++i) {
+    (void)wrs_to_post;
+    auto const& cmd = cmds_to_post[i];
+    if (cmd.dst_rank == static_cast<uint32_t>(my_rank)) {
+      fprintf(stderr, "Posting CXI write to itself\n");
+      std::abort();
+    }
+    ProxyCtx* ctx = ctxs[cmd.dst_rank].get();
+    if (!ctx || !ctx->cxi_transport ||
+        ctx->cxi_peer_addr == FI_ADDR_UNSPEC || ctx->cxi_remote_key == 0) {
+      fprintf(stderr, "Destination CXI ctx missing fields for dst=%u\n",
+              cmd.dst_rank);
+      std::abort();
+    }
+    uint64_t const remote_offset =
+        decode_write_offset(cmd.req_rptr, !use_normal_mode);
+    uint64_t const local_offset =
+        decode_write_offset(cmd.req_lptr, !use_normal_mode);
+    if (remote_offset + cmd.bytes > ctx->cxi_remote_len) {
+      fprintf(stderr,
+              "[CXI] Remote write OOB: offset=0x%llx len=%u size=%zu\n",
+              (unsigned long long)remote_offset, cmd.bytes,
+              (size_t)ctx->cxi_remote_len);
+      std::abort();
+    }
+    if (!ctx->cxi_local_base) {
+      fprintf(stderr, "CXI local base is missing for dst=%u\n", cmd.dst_rank);
+      std::abort();
+    }
+    if (local_offset + cmd.bytes > ctx->cxi_local_len) {
+      fprintf(stderr,
+              "[CXI] Local write OOB: rank=%d dst=%u offset=0x%llx len=%u "
+              "size=%zu normal=%d\n",
+              my_rank, cmd.dst_rank, (unsigned long long)local_offset,
+              cmd.bytes, (size_t)ctx->cxi_local_len,
+              static_cast<int>(use_normal_mode));
+      std::abort();
+    }
+    void* local = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(ctx->cxi_local_base) + local_offset);
+    (void)use_normal_mode;
+    append_write(ctx->cxi_transport.get(), ctx, ctx->cxi_peer_addr, local,
+                 local_offset, remote_offset, ctx->cxi_remote_key, cmd.bytes);
+  }
+
+  std::vector<uccl::cxi::WriteContext> write_contexts(writes.size());
+  std::unordered_map<uccl::cxi::Transport*,
+                     std::vector<uccl::cxi::WriteContext*>>
+      pending_by_transport;
+  pending_by_transport.reserve(writes.size());
+
+  for (size_t i = 0; i < writes.size(); ++i) {
+    auto const& write = writes[i];
+    write.transport->write(write.peer, write.local, write.bytes,
+                           write.remote_offset, write.remote_key,
+                           &write_contexts[i]);
+    pending_by_transport[write.transport].push_back(&write_contexts[i]);
+  }
+  maybe_print_cxi_write_stats(my_rank, wrs_to_post, cmds_to_post, writes,
+                              pending_by_transport);
+
+  for (auto& [transport, pending] : pending_by_transport) {
+    transport->wait_all(pending);
+  }
+}
+#endif
+
 static void post_rdma_async_batched_normal_mode(
     ProxyCtx& S, void* buf, size_t num_wrs,
     std::vector<uint64_t> const& wrs_to_post,
@@ -2079,6 +2324,15 @@ void post_rdma_async_batched(ProxyCtx& S, void* buf, size_t num_wrs,
                              std::vector<std::unique_ptr<ProxyCtx>>& ctxs,
                              int my_rank, int thread_idx,
                              bool use_normal_mode) {
+#ifdef USE_CXI
+  (void)S;
+  (void)buf;
+  (void)num_wrs;
+  (void)thread_idx;
+  post_rdma_async_batched_cxi(wrs_to_post, cmds_to_post, ctxs, my_rank,
+                              use_normal_mode);
+  return;
+#endif
   if (use_normal_mode) {
     post_rdma_async_batched_normal_mode(
         S, buf, num_wrs, wrs_to_post, cmds_to_post, ctxs, my_rank, thread_idx);
@@ -3461,6 +3715,46 @@ void post_atomic_operations(ProxyCtx& S,
                             int my_rank, int thread_idx,
                             std::unordered_set<uint64_t>& acked_wrs,
                             bool use_normal_mode) {
+#ifdef USE_CXI
+  (void)S;
+  (void)thread_idx;
+  (void)use_normal_mode;
+  if (wrs_to_post.size() != cmds_to_post.size()) {
+    fprintf(stderr, "CXI atomic size mismatch: wrs=%zu cmds=%zu\n",
+            wrs_to_post.size(), cmds_to_post.size());
+    std::abort();
+  }
+  for (size_t i = 0; i < cmds_to_post.size(); ++i) {
+    auto const& cmd = cmds_to_post[i];
+    if (cmd.dst_rank == static_cast<uint32_t>(my_rank)) {
+      fprintf(stderr, "Posting CXI atomic to itself\n");
+      std::abort();
+    }
+    ProxyCtx* ctx = ctxs[cmd.dst_rank].get();
+    if (!ctx || !ctx->cxi_transport ||
+        ctx->cxi_peer_addr == FI_ADDR_UNSPEC || ctx->cxi_remote_host_key == 0) {
+      fprintf(stderr, "Destination CXI host MR missing for dst=%u\n",
+              cmd.dst_rank);
+      std::abort();
+    }
+    if ((cmd.req_rptr & 0x7) != 0 ||
+        static_cast<uint64_t>(cmd.req_rptr) + sizeof(int64_t) >
+            ctx->cxi_remote_host_len) {
+      fprintf(stderr,
+              "[CXI] Remote atomic OOB or unaligned: offset=0x%x len=%zu\n",
+              cmd.req_rptr, (size_t)ctx->cxi_remote_host_len);
+      std::abort();
+    }
+    int v = static_cast<int>(cmd.value);
+    if (get_is_combine(cmd.cmd_type)) v = 1;
+    if (v == kLargeAtomicValue) v = kMaxSendAtomicValue;
+    ctx->cxi_transport->inject_atomic_add64(
+        ctx->cxi_peer_addr, static_cast<int64_t>(static_cast<int32_t>(v)),
+        cmd.req_rptr, ctx->cxi_remote_host_key);
+    acked_wrs.insert(wrs_to_post[i]);
+  }
+  return;
+#endif
   if (use_normal_mode) {
 #ifndef EFA
     post_atomic_operations_native_rdma(S, wrs_to_post, cmds_to_post, ctxs,

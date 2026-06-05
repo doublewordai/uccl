@@ -163,6 +163,7 @@ if __name__ == "__main__":
     nvcc_dlink = []
     extra_link_args = []
     use_dmabuf = False
+    use_cxi = int(os.getenv("USE_CXI", "0"))
 
     if torch.version.cuda:
         # Add CUDA library directory to library_dirs
@@ -233,6 +234,19 @@ if __name__ == "__main__":
             include_dirs.append(Path(efa_home) / "include")
             library_dirs.append(Path(efa_home) / "lib")
             libraries.append("efa")
+
+        if use_cxi:
+            libfabric_home = Path(os.getenv("LIBFABRIC_HOME", "/opt/libfabric"))
+            nvl_peers = int(os.getenv("UCCL_NUM_MAX_NVL_PEERS", "4"))
+            print(f"Building with CXI/libfabric transport support ({libfabric_home})")
+            print(f"Building CXI transport with NUM_MAX_NVL_PEERS={nvl_peers}")
+            cxx_flags.append("-DUSE_CXI")
+            nvcc_flags.append("-DUSE_CXI")
+            cxx_flags.append(f"-DNUM_MAX_NVL_PEERS={nvl_peers}")
+            nvcc_flags.append(f"-DNUM_MAX_NVL_PEERS={nvl_peers}")
+            include_dirs.append(libfabric_home / "include")
+            library_dirs.append(libfabric_home / "lib")
+            libraries.append("fabric")
 
         # DMA-BUF registration avoids nvidia_peermem/efa_nv_peermem.
         # Set USE_DMABUF=1 to compile with this path.
@@ -426,6 +440,7 @@ if __name__ == "__main__":
         if gpu_name:
             print(f" > GPU: {gpu_name}")
         print(f" > EFA Support: {'Yes' if has_efa else 'No'}")
+        print(f" > CXI Support: {'Yes' if use_cxi else 'No'}")
         print(f" > GH200 Support: {'Yes' if has_gh200 else 'No'}")
         print(f" > DMA-BUF Support: {'Yes' if use_dmabuf else 'No'}")
     print(f" > Device Arch: {device_arch}")
