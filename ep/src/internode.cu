@@ -13,6 +13,30 @@ namespace uccl {
 
 namespace internode {
 
+// See internode.cuh: cumulative tail-push ledger (host-mapped), indexed
+// [op][channel][dst_rdma_rank]. Written by the dispatch RDMA sender and
+// the combine forwarder right where they advance the remote tail.
+__device__ int64_t* uccl_tail_ledger = nullptr;
+
+cudaError_t set_tail_ledger(int64_t* device_ptr) {
+  return cudaMemcpyToSymbol(uccl_tail_ledger, &device_ptr,
+                            sizeof(device_ptr));
+}
+
+__device__ __forceinline__ void tail_ledger_add(int op, int channel,
+                                                int dst_rdma, int64_t v) {
+  if (uccl_tail_ledger == nullptr) return;
+  if (channel >= kTailLedgerMaxChannels || dst_rdma >= kTailLedgerMaxRdma)
+    return;
+  atomicAdd(reinterpret_cast<unsigned long long*>(
+                uccl_tail_ledger +
+                (static_cast<int64_t>(op) * kTailLedgerMaxChannels + channel) *
+                    kTailLedgerMaxRdma +
+                dst_rdma),
+            static_cast<unsigned long long>(v));
+}
+
+
 __device__ __forceinline__ uint64_t pack_token_in_nvl_ranks(
     bool const* is_token_in_nvl_ranks) {
   uint64_t packed = 0;
@@ -1137,6 +1161,7 @@ __global__ void __launch_bounds__(
         if (lane_id == dst_rdma_rank) {
           last_issued_tail += num_tokens_to_issue;
           num_tokens_to_send -= num_tokens_to_issue;
+          tail_ledger_add(0, channel_id, dst_rdma_rank, num_tokens_to_issue);
           uccl::nvshmemi_ibgda_amo_nonfetch_add</*use_normal_mode=*/true>(
               reinterpret_cast<uint64_t>(rdma_channel_tail.buffer(rdma_rank)),
               reinterpret_cast<uint64_t>(original_atomic_buffer_ptr),
@@ -2830,6 +2855,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
           // Write new RDMA tail
           __syncwarp();
           if (lane_id == 0) {
+            tail_ledger_add(1, channel_id, dst_rdma_rank, num_chunked_tokens);
             uccl::nvshmemi_ibgda_amo_nonfetch_add</*use_normal_mode=*/true>(
                 reinterpret_cast<uint64_t>(rdma_channel_tail.buffer(rdma_rank)),
                 reinterpret_cast<uint64_t>(original_atomic_buffer_ptr),

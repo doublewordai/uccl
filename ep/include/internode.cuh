@@ -14,6 +14,17 @@ struct SourceMeta;
 
 int get_source_meta_bytes();
 
+// Wedge forensics: host-mapped ledger of cumulative RDMA tail advances
+// pushed by this rank, per (op, channel, dst RDMA rank); op 0 = dispatch
+// send, op 1 = combine forward. The values mirror the amo_nonfetch_add
+// increments on the remote rdma_channel_tail, so they are directly
+// comparable with the tail a starving receiver prints. nullptr disables.
+constexpr int kTailLedgerOps = 2;
+constexpr int kTailLedgerMaxChannels = 64;
+constexpr int kTailLedgerMaxRdma = 16;
+cudaError_t set_tail_ledger(int64_t* device_ptr);
+
+
 __host__ __device__ __forceinline__ int get_num_bytes_per_token(
     int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights);
 

@@ -498,6 +498,20 @@ class Buffer {
         const_cast<int*>(moe_recv_counter), 0));
     *moe_recv_counter = -1;
 
+    {
+      size_t const ledger_bytes = internode::kTailLedgerOps *
+                                  internode::kTailLedgerMaxChannels *
+                                  internode::kTailLedgerMaxRdma *
+                                  sizeof(int64_t);
+      CUDA_CHECK(cudaMallocHost(&tail_ledger_host, ledger_bytes,
+                                cudaHostAllocMapped));
+      memset(tail_ledger_host, 0, ledger_bytes);
+      int64_t* ledger_dev = nullptr;
+      CUDA_CHECK(cudaHostGetDevicePointer(
+          reinterpret_cast<void**>(&ledger_dev), tail_ledger_host, 0));
+      CUDA_CHECK(internode::set_tail_ledger(ledger_dev));
+    }
+
     CUDA_CHECK(cudaMallocHost(&moe_recv_expert_counter,
                               sizeof(int) * NUM_MAX_LOCAL_EXPERTS,
                               cudaHostAllocMapped));
@@ -732,7 +746,16 @@ class Buffer {
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - start_time)
                 .count() > get_cpu_timeout_secs(NUM_CPU_TIMEOUT_SECS)) {
-          throw std::runtime_error("DeepEP error: CPU recv timeout");
+          int pending_experts = 0;
+          for (int i = 0; i < num_local_experts; ++i)
+            if (moe_recv_expert_counter[i] < 0) ++pending_experts;
+          char buf[192];
+          snprintf(buf, sizeof(buf),
+                   "DeepEP error: CPU recv timeout [rank=%d nvl_counter=%d "
+                   "pending_experts=%d/%d]",
+                   rank, num_recv_tokens, pending_experts, num_local_experts);
+          dump_tail_ledger(buf);
+          throw std::runtime_error(buf);
         }
       }
       num_recv_tokens_per_expert_list = std::vector<int>(
@@ -992,7 +1015,25 @@ class Buffer {
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - start_time)
                 .count() > get_cpu_timeout_secs(NUM_CPU_TIMEOUT_SECS)) {
-          throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
+          // Forensics: which half of the notify handshake never arrived.
+          // -1 means the kernel never wrote that counter (its cross-rank
+          // exchange did not complete); >=0 means it did.
+          int pending_experts = 0, first_pending = -1;
+          for (int i = 0; i < num_local_experts; ++i) {
+            if (moe_recv_expert_counter[i] < 0) {
+              ++pending_experts;
+              if (first_pending < 0) first_pending = i;
+            }
+          }
+          char buf[256];
+          snprintf(buf, sizeof(buf),
+                   "DeepEP error: timeout (dispatch CPU) [rank=%d "
+                   "nvl_counter=%d rdma_counter=%d pending_experts=%d/%d "
+                   "first_pending=%d]",
+                   rank, num_recv_tokens, num_rdma_recv_tokens,
+                   pending_experts, num_local_experts, first_pending);
+          dump_tail_ledger(buf);
+          throw std::runtime_error(buf);
         }
       }
       num_recv_tokens_per_expert_list = std::vector<int>(
@@ -1699,6 +1740,32 @@ class Buffer {
     return is_available() and num_ranks > NUM_MAX_NVL_PEERS;
   }
 
+
+  // Print nonzero tail-ledger rows. Called on CPU-side EP timeouts: the
+  // host-mapped ledger stays readable even if a peer (or this rank's own
+  // kernel) trapped, and the cumulative values are directly comparable
+  // with the tail printed by a starving combine receiver on the peer.
+  void dump_tail_ledger(char const* why) {
+    if (tail_ledger_host == nullptr) return;
+    fprintf(stderr, "[uccl-tail-ledger rank=%d why=%s]", rank, why);
+    for (int op = 0; op < internode::kTailLedgerOps; ++op)
+      for (int c = 0; c < internode::kTailLedgerMaxChannels; ++c)
+        for (int d = 0; d < internode::kTailLedgerMaxRdma; ++d) {
+          int64_t v =
+              tail_ledger_host[(static_cast<int64_t>(op) *
+                                    internode::kTailLedgerMaxChannels +
+                                c) *
+                                   internode::kTailLedgerMaxRdma +
+                               d];
+          if (v != 0)
+            fprintf(stderr, " %s,ch%d,dst%d=%lld",
+                    op == 0 ? "disp" : "comb", c, d,
+                    static_cast<long long>(v));
+        }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+  }
+
  private:
   int rank{0};
   int num_ranks{1};
@@ -1735,6 +1802,9 @@ class Buffer {
   // clang-format off
   // MoE counters (host mapped)
   volatile int* moe_recv_counter = nullptr;
+  // Wedge forensics (see internode.cuh): host-mapped tail-push ledger,
+  // readable from the host even after a device-side trap.
+  int64_t* tail_ledger_host = nullptr;
   int* moe_recv_counter_mapped{nullptr};  // device pointer
   volatile int* moe_recv_expert_counter{nullptr};
   int* moe_recv_expert_counter_mapped{nullptr};
