@@ -1548,7 +1548,17 @@ void Proxy::send_barrier(uint64_t wr) {
 #endif
   assert(ctx_.barrier_wr == -1 && "barrier_wr should be 0");
   ctx_.barrier_wr = wr;
+#ifdef USE_CXI
+  // The CXI barrier compares seq against per-node slot counters that are
+  // NIC atomic adds and never reset, so seq must stay monotonic for the
+  // process lifetime: wrapping at kSeqMask (2^21) would make every
+  // `slots[node] >= seq` check pass spuriously and release barriers
+  // without synchronizing. The 21-bit mask only exists for the verbs
+  // immediate-data encoding, which the CXI path does not use.
+  ctx_.barrier_seq = ctx_.barrier_seq + 1;
+#else
   ctx_.barrier_seq = (ctx_.barrier_seq + 1) & BarrierImm::kSeqMask;
+#endif
 
   if (cfg_.rank == ctx_.node_leader_rank) {
     if (ctx_.barrier_arrived.size() != static_cast<size_t>(cfg_.num_nodes)) {
