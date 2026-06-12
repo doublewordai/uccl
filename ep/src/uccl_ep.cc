@@ -383,9 +383,21 @@ class Buffer {
           // qword = kCanaryMagic ^ its absolute address) so any zero/garbage
           // sweep that touches the neighborhood reports its exact extent.
           size_t const canary_bytes = size_t{2} << 20;  // 2MB each side
-          CUDA_CHECK(cudaMallocManaged(
-              &d_handle_window_alloc,
-              2 * canary_bytes + window_bytes + 2 * page));
+          bool const passive =
+              std::getenv("UCCL_D2H_TRAP_SCAN") == nullptr;
+          d_handle_passive = passive;
+          if (passive) {
+            // v5: plain device memory — included in GPU coredumps (managed
+            // is not), zero host-side runtime engagement so the race is
+            // unperturbed. Canary geometry is read post-mortem from the
+            // victim fault's full coredump.
+            CUDA_CHECK(cudaMalloc(&d_handle_window_alloc,
+                                  2 * canary_bytes + window_bytes + 2 * page));
+          } else {
+            CUDA_CHECK(cudaMallocManaged(
+                &d_handle_window_alloc,
+                2 * canary_bytes + window_bytes + 2 * page));
+          }
           uintptr_t const canary_lo_base =
               (reinterpret_cast<uintptr_t>(d_handle_window_alloc) + page - 1) &
               ~(page - 1);
@@ -393,11 +405,26 @@ class Buffer {
           d_canary_lo = reinterpret_cast<uint64_t*>(canary_lo_base);
           d_canary_hi = reinterpret_cast<uint64_t*>(aligned + window_bytes);
           d_canary_qwords = canary_bytes / sizeof(uint64_t);
-          for (size_t q = 0; q < d_canary_qwords; ++q) {
-            d_canary_lo[q] =
-                kCanaryMagic ^ reinterpret_cast<uintptr_t>(d_canary_lo + q);
-            d_canary_hi[q] =
-                kCanaryMagic ^ reinterpret_cast<uintptr_t>(d_canary_hi + q);
+          {
+            std::vector<uint64_t> stage(d_canary_qwords);
+            for (size_t q = 0; q < d_canary_qwords; ++q)
+              stage[q] = kCanaryMagic ^
+                         reinterpret_cast<uintptr_t>(d_canary_lo + q);
+            if (passive) {
+              CUDA_CHECK(cudaMemcpy(d_canary_lo, stage.data(), canary_bytes,
+                                    cudaMemcpyHostToDevice));
+            } else {
+              memcpy(d_canary_lo, stage.data(), canary_bytes);
+            }
+            for (size_t q = 0; q < d_canary_qwords; ++q)
+              stage[q] = kCanaryMagic ^
+                         reinterpret_cast<uintptr_t>(d_canary_hi + q);
+            if (passive) {
+              CUDA_CHECK(cudaMemcpy(d_canary_hi, stage.data(), canary_bytes,
+                                    cudaMemcpyHostToDevice));
+            } else {
+              memcpy(d_canary_hi, stage.data(), canary_bytes);
+            }
           }
           d_handle_objs = reinterpret_cast<d2hq::D2HHandle*>(aligned);
           d_handles =
@@ -405,24 +432,37 @@ class Buffer {
           d_handle_window = reinterpret_cast<void*>(aligned);
           d_handle_window_bytes = window_bytes;
 
-          for (int i = 0; i < num_d2h_channel_addrs; ++i) {
+          {
+            std::vector<d2hq::D2HHandle> stage_objs(num_d2h_channel_addrs);
+            std::vector<uint64_t> stage_addrs(num_d2h_channel_addrs);
+            for (int i = 0; i < num_d2h_channel_addrs; ++i) {
 #ifndef USE_MSCCLPP_FIFO_BACKEND
-            void* host_ptr = reinterpret_cast<void*>(host_addrs[i]);
-            void* dev_ptr = nullptr;
+              void* host_ptr = reinterpret_cast<void*>(host_addrs[i]);
+              void* dev_ptr = nullptr;
 #ifndef USE_GRACE_HOPPER
-            CUDA_CHECK(cudaHostGetDevicePointer(
-                reinterpret_cast<void**>(&dev_ptr), host_ptr, 0));
+              CUDA_CHECK(cudaHostGetDevicePointer(
+                  reinterpret_cast<void**>(&dev_ptr), host_ptr, 0));
 #else
-            dev_ptr = host_ptr;
+              dev_ptr = host_ptr;
 #endif
-            d_handle_objs[i].init_from_dev_ptr(dev_ptr);
-            d_handles[i] = reinterpret_cast<uint64_t>(&d_handle_objs[i]);
+              stage_objs[i].init_from_dev_ptr(dev_ptr);
+              stage_addrs[i] = reinterpret_cast<uint64_t>(&d_handle_objs[i]);
 #else
-            auto* fifo = reinterpret_cast<mscclpp::Fifo*>(host_addrs[i]);
-            mscclpp::FifoDeviceHandle h = fifo->deviceHandle();
-            d_handle_objs[i].init_from_host_value(h);
-            d_handles[i] = reinterpret_cast<uint64_t>(d_handle_objs + i);
+              auto* fifo = reinterpret_cast<mscclpp::Fifo*>(host_addrs[i]);
+              mscclpp::FifoDeviceHandle h = fifo->deviceHandle();
+              stage_objs[i].init_from_host_value(h);
+              stage_addrs[i] = reinterpret_cast<uint64_t>(d_handle_objs + i);
 #endif
+            }
+            if (d_handle_passive) {
+              CUDA_CHECK(cudaMemcpy(d_handle_objs, stage_objs.data(),
+                                    objs_bytes, cudaMemcpyHostToDevice));
+              CUDA_CHECK(cudaMemcpy(d_handles, stage_addrs.data(), addrs_bytes,
+                                    cudaMemcpyHostToDevice));
+            } else {
+              memcpy(d_handle_objs, stage_objs.data(), objs_bytes);
+              memcpy(d_handles, stage_addrs.data(), addrs_bytes);
+            }
           }
 
           // Trap history: v1 (device-resident + mprotect) saw the handle
@@ -437,13 +477,14 @@ class Buffer {
           // timestamps plus FULL-memory coredumps for post-mortem sweep
           // forensics at the victim fault.
           bool const pin_host =
+              !d_handle_passive &&
               std::getenv("UCCL_D2H_TRAP_HOST_PIN") != nullptr;
           if (pin_host) {
             CUDA_CHECK(cudaMemAdvise(d_handle_window_alloc,
                                      2 * canary_bytes + window_bytes + 2 * page,
                                      cudaMemAdviseSetPreferredLocation,
                                      cudaCpuDeviceId));
-          } else {
+          } else if (!d_handle_passive) {
             cudaMemLocation loc;
             loc.type = cudaMemLocationTypeDevice;
             loc.id = device_index;
@@ -454,25 +495,34 @@ class Buffer {
           CUDA_CHECK(cudaDeviceSynchronize());
 
           // Arm the wild-write trap: snapshot for the detection fallback,
-          // then try to make the window read-only.
-          d_handle_snapshot.assign(
-              reinterpret_cast<uint8_t*>(d_handle_window),
-              reinterpret_cast<uint8_t*>(d_handle_window) + objs_bytes +
-                  addrs_bytes);
-          if (mprotect(d_handle_window, d_handle_window_bytes, PROT_READ) ==
-              0) {
-            d_handle_protected = true;
+          // then try to make the window read-only. Passive (v5) mode skips
+          // all host-side engagement; the coredump carries the forensics.
+          if (d_handle_passive) {
             fprintf(stderr,
-                    "[d2h-handle-trap] window %p (+%zu) mprotect(PROT_READ) "
-                    "armed\n",
-                    d_handle_window, d_handle_window_bytes);
+                    "[d2h-handle-trap] passive v5: device window %p (+%zu), "
+                    "canaries %p/%p (+%zu each); forensics via coredump\n",
+                    d_handle_window, d_handle_window_bytes, (void*)d_canary_lo,
+                    (void*)d_canary_hi, canary_bytes);
           } else {
-            fprintf(stderr,
-                    "[d2h-handle-trap] mprotect failed (%s); falling back to "
-                    "snapshot detection only\n",
-                    strerror(errno));
+            d_handle_snapshot.assign(
+                reinterpret_cast<uint8_t*>(d_handle_window),
+                reinterpret_cast<uint8_t*>(d_handle_window) + objs_bytes +
+                    addrs_bytes);
+            if (mprotect(d_handle_window, d_handle_window_bytes, PROT_READ) ==
+                0) {
+              d_handle_protected = true;
+              fprintf(stderr,
+                      "[d2h-handle-trap] window %p (+%zu) mprotect(PROT_READ) "
+                      "armed\n",
+                      d_handle_window, d_handle_window_bytes);
+            } else {
+              fprintf(stderr,
+                      "[d2h-handle-trap] mprotect failed (%s); falling back "
+                      "to snapshot detection only\n",
+                      strerror(errno));
+            }
+            start_d2h_watchdog();
           }
-          start_d2h_watchdog();
         }
         // Allocate device memory for IPC base pointers
         CUDA_CHECK(
@@ -1833,6 +1883,7 @@ class Buffer {
   void* d_handle_window{nullptr};
   size_t d_handle_window_bytes{0};
   bool d_handle_protected{false};
+  bool d_handle_passive{true};
   std::vector<uint8_t> d_handle_snapshot;
   uint64_t d_handle_check_counter{0};
   // Canary v4: self-describing guard regions around the handle page.
@@ -1844,7 +1895,7 @@ class Buffer {
   // Scan one canary region; report the divergence extent (the sweep's
   // geometry: first/last offset + sample values fingerprint the writer).
   bool scan_canary(char const* name, uint64_t* base) {
-    if (!base || d_canary_qwords == 0) return false;
+    if (d_handle_passive || !base || d_canary_qwords == 0) return false;
     size_t first = SIZE_MAX, last = 0, count = 0;
     uint64_t sample_val = 0;
     size_t sample_off = 0;
@@ -1875,7 +1926,8 @@ class Buffer {
   // snapshot; report the sweep shape (first/last divergent offsets
   // fingerprint the writer's loop) plus the first few diffs.
   void check_d2h_handles(char const* where) {
-    if (d_handle_snapshot.empty() || !d_handle_window) return;
+    if (d_handle_passive || d_handle_snapshot.empty() || !d_handle_window)
+      return;
     auto const* live = reinterpret_cast<uint8_t const*>(d_handle_window);
     size_t const n = d_handle_snapshot.size();
     if (memcmp(live, d_handle_snapshot.data(), n) == 0) return;
