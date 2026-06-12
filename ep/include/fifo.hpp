@@ -28,6 +28,10 @@ class Fifo {
   /// Remove the head trigger.
   void pop();
 
+  /// Count slots currently holding an unconsumed trigger (diagnostic;
+  /// host-visible backlog the proxy has not popped yet).
+  size_t backlog() const;
+
   /// Get FIFO size.
   /// @return Number of entries in the FIFO.
   int size() const;

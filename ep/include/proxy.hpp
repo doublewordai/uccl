@@ -109,6 +109,10 @@ class Proxy {
   void barrier_check();
   void quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds);
   void quiet_cq();
+  // Pipeline half of the quiet fence: take and post every command already
+  // visible in this proxy's rings before draining the transport (FIFO
+  // backend only; see the comment in the implementation).
+  void drain_rings_for_quiet();
   RDMAConnectionInfo local_info_{}, remote_info_{};
 
   // Reuse across multiple calls to avoid reallocations

@@ -60,6 +60,15 @@ void Fifo::pop() {
   atomicStore(pimpl_->tail.get(), curTail + 1, memoryOrderRelease);
 }
 
+size_t Fifo::backlog() const {
+  size_t n = 0;
+  for (int i = 0; i < pimpl_->size; ++i) {
+    if (atomicLoad(&(pimpl_->triggers.get()[i].fst), memoryOrderAcquire) != 0)
+      ++n;
+  }
+  return n;
+}
+
 int Fifo::size() const { return pimpl_->size; }
 
 FifoDeviceHandle Fifo::deviceHandle() const {

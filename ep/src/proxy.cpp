@@ -814,11 +814,15 @@ void Proxy::stall_scan() {
   }
   for (size_t rb = 0; rb < cfg_.d2h_queues.size(); ++rb) {
     auto& pend = fifo_pending_[rb];
-    if (pend.empty()) {
+    auto* fifo = cfg_.d2h_queues[rb].fifo;
+    size_t const backlog = fifo ? fifo->backlog() : 0;
+    if (pend.empty() && backlog == 0) {
       stall_front_wr_[rb] = ~0ull;
       continue;
     }
-    uint64_t const front = pend.front().first;
+    // pend empty but triggers visible: the take loop is not taking. Track
+    // it as a pseudo-front so persistence gates the report the same way.
+    uint64_t const front = pend.empty() ? ~1ull : pend.front().first;
     if (stall_front_wr_[rb] != front) {
       stall_front_wr_[rb] = front;
       stall_front_since_[rb] = now;
@@ -832,11 +836,12 @@ void Proxy::stall_scan() {
                             .count();
     fprintf(stderr,
             "[proxy-ring-jam rank=%d thread=%d rb=%zu] front_wr=0x%llx "
-            "pend=%zu jam_ms=%lld quiet_wr=%d barrier_wr=%d "
+            "pend=%zu backlog=%zu jam_ms=%lld quiet_wr=%d barrier_wr=%d "
             "barrier_inflight=%d inflight_bytes=%zu\n",
             cfg_.rank, cfg_.thread_idx, rb,
-            (unsigned long long)front, pend.size(), (long long)jam_ms,
-            ctx_.quiet_wr, ctx_.barrier_wr, (int)ctx_.barrier_inflight,
+            (unsigned long long)front, pend.size(), backlog,
+            (long long)jam_ms, ctx_.quiet_wr, ctx_.barrier_wr,
+            (int)ctx_.barrier_inflight,
             current_inflight_bytes.load(std::memory_order_acquire));
 #if defined(USE_CXI) && !defined(USE_SUBSET_BARRIER)
     if (ctx_.barrier_inflight && ctx_.lb) {
@@ -1330,8 +1335,66 @@ void Proxy::quiet_cq() {
   }
 }
 
+void Proxy::drain_rings_for_quiet() {
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+  // The quiet fence has two halves. quiet_cq() drains the TRANSPORT
+  // (posted writes + deferred atomics), but commands still parked in this
+  // proxy's rings are invisible to it: the per-ring take budget
+  // (kMaxInflightNormal=8, retired in order) routinely leaves pre-quiet
+  // data writes sitting in the FIFO when the QUIET trigger is taken from
+  // ring 0. Completing the quiet without them breaks the fence — the
+  // stragglers post after the device has moved on and land in the next
+  // round's counts region (2026-06-12 conc-1024 kill: bf16 garbage in
+  // counts_from_rdma_rank at dispatch seq 205; the same gap delivers
+  // counts late -> MISSING). The device commits every pre-quiet command
+  // before committing the QUIET, so by the time the QUIET is taken,
+  // everything the fence must cover is already visible here: take and
+  // post ALL of it, budget-exempt, before touching the transport.
+  // A QUIET/BARRIER encountered mid-ring ends that ring's drain (the
+  // device serializes quiets; ring 0 still holds the in-flight QUIET we
+  // are processing, deliberately un-popped until completion).
+  std::vector<uint64_t> drain_wrs;
+  std::vector<TransferCmd> drain_cmds;
+  StallReporter stall("quiet_ring_drain", cfg_.rank, cfg_.thread_idx);
+  for (bool progressed = true; progressed;) {
+    progressed = false;
+    for (size_t rb = 0; rb < cfg_.d2h_queues.size(); ++rb) {
+      auto* fifo = cfg_.d2h_queues[rb].fifo;
+      if (!fifo) continue;
+      for (;;) {
+        auto trig = fifo->poll();
+        if (trig.fst == 0) break;
+        TransferCmd cmd = d2hq::decode_from_trigger(trig);
+        auto const base = get_base_cmd(cmd.cmd_type);
+        if (base == CmdType::QUIET || base == CmdType::BARRIER) break;
+        uint64_t const wr = (static_cast<uint64_t>(rb) << 32) |
+                            (fifo_seq_[rb]++ & 0xFFFFFFFFULL);
+        fifo_pending_[rb].push_back(
+            std::make_pair(wr, static_cast<size_t>(cmd.bytes)));
+        if (base == CmdType::WRITE && cmd.bytes > 0) {
+          current_inflight_bytes.fetch_add(static_cast<size_t>(cmd.bytes),
+                                           std::memory_order_release);
+        }
+        fifo->pop();
+        drain_wrs.push_back(wr);
+        drain_cmds.push_back(cmd);
+        progressed = true;
+      }
+    }
+    if (!drain_wrs.empty()) {
+      post_gpu_commands_mixed(drain_wrs, drain_cmds);
+      drain_wrs.clear();
+      drain_cmds.clear();
+      adaptive_sleeper_.update_timer();
+    }
+    stall.tick("draining rings ahead of quiet");
+  }
+#endif
+}
+
 void Proxy::quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds) {
   assert(cmds.size() == 1 && "quiet size must be 1");
+  drain_rings_for_quiet();
   quiet_cq();
   acked_wrs_.insert(wrs[0]);
 }
