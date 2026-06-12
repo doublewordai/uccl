@@ -147,6 +147,15 @@ class Proxy {
   std::vector<uint64_t> ring_tails_;
   std::vector<size_t> ring_seen_;
 #endif
+
+  // Wedge introspection: detect a ring whose pending front stops retiring
+  // (head-of-line jam) and report it with full quiet/barrier state. Called
+  // from the proxy main loop, internally rate-limited.
+  void stall_scan();
+  uint64_t stall_scan_iter_ = 0;
+  std::vector<uint64_t> stall_front_wr_;
+  std::vector<std::chrono::steady_clock::time_point> stall_front_since_;
+  std::vector<std::chrono::steady_clock::time_point> stall_next_report_;
 };
 
 #endif  // PROXY_HPP

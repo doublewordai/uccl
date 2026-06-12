@@ -2,6 +2,7 @@
 #include "adaptive_sleeper.hpp"
 #include "common.hpp"
 #include "proxy_ctx.hpp"
+#include "proxy_stall.hpp"
 #include "rdma_util.hpp"
 #include "util/gpu_rt.h"
 #include <infiniband/verbs.h>
@@ -1516,6 +1517,7 @@ size_t cxi_retire_ctx(ProxyCtx& ctx, std::unordered_set<uint64_t>& acked_wrs,
          ctx.cxi_pending_atomics.front().threshold <=
              ctx.cxi_writes_completed) {
     auto const& pa = ctx.cxi_pending_atomics.front();
+    StallReporter stall("retire_atomic_eagain", -1, -1, -1);
     while (transport->try_inject_atomic_add64(ctx.cxi_peer_addr, pa.value,
                                               pa.remote_offset,
                                               ctx.cxi_remote_host_key) ==
@@ -1528,6 +1530,9 @@ size_t cxi_retire_ctx(ProxyCtx& ctx, std::unordered_set<uint64_t>& acked_wrs,
       }
       ctx.cxi_writes_completed += n;
       if (n == 0) cpu_relax();
+      stall.tick("outstanding=%zu pending_atomics=%zu value=%lld",
+                 transport->outstanding(), ctx.cxi_pending_atomics.size(),
+                 (long long)pa.value);
     }
     ctx.cxi_pending_atomics.pop_front();
   }
@@ -1692,16 +1697,27 @@ static void post_rdma_async_batched_cxi(
     // from same-TX-context submission order.
     size_t const cap = cxi_max_outstanding();
     for (auto& write : writes) {
-      while (write.transport->outstanding() >= cap) {
-        if (cxi_retire_ctx(*write.ctx, acked_wrs, 64) == 0) {
-          if (progress_run &&
-              !progress_run->load(std::memory_order_acquire))
-            return;
-          cpu_relax();
+      {
+        StallReporter stall("post_cap_wait", my_rank, -1, -1);
+        while (write.transport->outstanding() >= cap) {
+          if (cxi_retire_ctx(*write.ctx, acked_wrs, 64) == 0) {
+            if (progress_run &&
+                !progress_run->load(std::memory_order_acquire))
+              return;
+            cpu_relax();
+          }
+          stall.tick("outstanding=%zu cap=%zu pending_atomics=%zu "
+                     "posted=%llu completed=%llu bytes=%zu",
+                     write.transport->outstanding(), cap,
+                     write.ctx->cxi_pending_atomics.size(),
+                     (unsigned long long)write.ctx->cxi_writes_posted,
+                     (unsigned long long)write.ctx->cxi_writes_completed,
+                     write.bytes);
         }
       }
       uccl::cxi::WriteContext* c = write.transport->acquire_context();
       c->wr_ids = std::move(write.wr_ids);
+      StallReporter stall("post_write_eagain", my_rank, -1, -1);
       while (write.transport->try_write(write.peer, write.local, write.bytes,
                                         write.remote_offset, write.remote_key,
                                         c) == -FI_EAGAIN) {
@@ -1713,6 +1729,9 @@ static void post_rdma_async_batched_cxi(
           }
           cpu_relax();
         }
+        stall.tick("outstanding=%zu pending_atomics=%zu bytes=%zu",
+                   write.transport->outstanding(),
+                   write.ctx->cxi_pending_atomics.size(), write.bytes);
       }
       ++write.ctx->cxi_writes_posted;
     }
@@ -3875,6 +3894,8 @@ void post_atomic_operations(ProxyCtx& S,
         ctx->cxi_pending_atomics.push_back(ProxyCtx::CxiPendingAtomic{
             value64, cmd.req_rptr, ctx->cxi_writes_posted});
       } else {
+        StallReporter stall("post_atomic_eagain", my_rank, thread_idx,
+                            (int)cmd.dst_rank);
         while (ctx->cxi_transport->try_inject_atomic_add64(
                    ctx->cxi_peer_addr, value64, cmd.req_rptr,
                    ctx->cxi_remote_host_key) == -FI_EAGAIN) {
@@ -3882,6 +3903,9 @@ void post_atomic_operations(ProxyCtx& S,
             if (!S.progress_run.load(std::memory_order_acquire)) return;
             cpu_relax();
           }
+          stall.tick("outstanding=%zu pending_atomics=%zu value=%lld",
+                     ctx->cxi_transport->outstanding(),
+                     ctx->cxi_pending_atomics.size(), (long long)value64);
         }
       }
     } else {

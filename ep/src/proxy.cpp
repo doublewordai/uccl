@@ -2,6 +2,7 @@
 #include "bench_utils.hpp"
 #include "d2h_queue_host.hpp"
 #include "ep_util.hpp"
+#include "proxy_stall.hpp"
 #include "rdma.hpp"
 #include "util/util.h"
 #include <arpa/inet.h>  // for htonl, ntohl
@@ -721,6 +722,7 @@ void Proxy::run_dual() {
     if (cfg_.use_normal_mode) {
       barrier_check();
     }
+    stall_scan();
   }
 
 #ifdef USE_CXI
@@ -799,6 +801,73 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
 #endif
 
   adaptive_sleeper_.update_timer();
+}
+
+void Proxy::stall_scan() {
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+  if ((++stall_scan_iter_ & 0x3FFull) != 0) return;
+  auto const now = std::chrono::steady_clock::now();
+  if (stall_front_wr_.size() != cfg_.d2h_queues.size()) {
+    stall_front_wr_.assign(cfg_.d2h_queues.size(), ~0ull);
+    stall_front_since_.assign(cfg_.d2h_queues.size(), now);
+    stall_next_report_.assign(cfg_.d2h_queues.size(), now);
+  }
+  for (size_t rb = 0; rb < cfg_.d2h_queues.size(); ++rb) {
+    auto& pend = fifo_pending_[rb];
+    if (pend.empty()) {
+      stall_front_wr_[rb] = ~0ull;
+      continue;
+    }
+    uint64_t const front = pend.front().first;
+    if (stall_front_wr_[rb] != front) {
+      stall_front_wr_[rb] = front;
+      stall_front_since_[rb] = now;
+      stall_next_report_[rb] = now + std::chrono::seconds(3);
+      continue;
+    }
+    if (now < stall_next_report_[rb]) continue;
+    stall_next_report_[rb] = now + std::chrono::seconds(5);
+    auto const jam_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - stall_front_since_[rb])
+                            .count();
+    fprintf(stderr,
+            "[proxy-ring-jam rank=%d thread=%d rb=%zu] front_wr=0x%llx "
+            "pend=%zu jam_ms=%lld quiet_wr=%d barrier_wr=%d "
+            "barrier_inflight=%d inflight_bytes=%zu\n",
+            cfg_.rank, cfg_.thread_idx, rb,
+            (unsigned long long)front, pend.size(), (long long)jam_ms,
+            ctx_.quiet_wr, ctx_.barrier_wr, (int)ctx_.barrier_inflight,
+            current_inflight_bytes.load(std::memory_order_acquire));
+#if defined(USE_CXI) && !defined(USE_SUBSET_BARRIER)
+    if (ctx_.barrier_inflight && ctx_.lb) {
+      char arrive[128] = {0}, release[128] = {0}, slots_s[256] = {0};
+      size_t ap = 0, rp = 0, sp = 0;
+      for (int lr = 0; lr < ctx_.num_local_ranks && lr < UCCL_MAX_LOCAL_RANKS;
+           ++lr) {
+        ap += snprintf(arrive + ap, sizeof(arrive) - ap, "%llu,",
+                       (unsigned long long)ctx_.lb->arrive_seq[lr].load(
+                           std::memory_order_acquire));
+        rp += snprintf(release + rp, sizeof(release) - rp, "%llu,",
+                       (unsigned long long)ctx_.lb->release_seq[lr].load(
+                           std::memory_order_acquire));
+      }
+      auto* slots = cxi_barrier_slots(atomic_buffer_ptr_);
+      for (int s = 0; s < 2 * cfg_.num_nodes && sp + 24 < sizeof(slots_s);
+           ++s) {
+        sp += snprintf(slots_s + sp, sizeof(slots_s) - sp, "%lld,",
+                       (long long)slots[s].load(std::memory_order_acquire));
+      }
+      fprintf(stderr,
+              "[proxy-barrier-state rank=%d thread=%d] seq=%llu "
+              "leader=%d arrive=[%s] release=[%s] cxi_slots=[%s]\n",
+              cfg_.rank, cfg_.thread_idx,
+              (unsigned long long)ctx_.barrier_seq,
+              (int)(cfg_.rank == ctx_.node_leader_rank), arrive, release,
+              slots_s);
+    }
+#endif
+  }
+#endif
 }
 
 void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
@@ -1201,14 +1270,23 @@ void Proxy::quiet_cq() {
   if (cxi_fast_mode()) {
     // Drain all outstanding async writes AND deferred control atomics so
     // quiet means "everything sent", matching the verbs path's semantics.
-    for (auto& c : ctxs_for_all_ranks_) {
+    for (size_t peer = 0; peer < ctxs_for_all_ranks_.size(); ++peer) {
+      auto& c = ctxs_for_all_ranks_[peer];
       if (!c || !c->cxi_transport) continue;
+      StallReporter stall("quiet_cq", cfg_.rank, cfg_.thread_idx,
+                          static_cast<int>(peer));
       while (c->cxi_transport->outstanding() > 0 ||
              !c->cxi_pending_atomics.empty()) {
         if (cxi_retire_ctx(*c, acked_wrs_, 64) == 0) {
           if (!ctx_.progress_run.load(std::memory_order_acquire)) return;
           cpu_relax();
         }
+        stall.tick("outstanding=%zu pending_atomics=%zu posted=%llu "
+                   "completed=%llu",
+                   c->cxi_transport->outstanding(),
+                   c->cxi_pending_atomics.size(),
+                   (unsigned long long)c->cxi_writes_posted,
+                   (unsigned long long)c->cxi_writes_completed);
       }
     }
   }
@@ -1472,17 +1550,27 @@ void Proxy::post_barrier_msg(int dst_rank, bool ack, uint64_t seq) {
   if (cxi_fast_mode()) {
     // Barriers imply all prior traffic to this peer is on the wire: drain
     // outstanding writes and deferred atomics first (barriers are rare).
-    while (ctx->cxi_transport->outstanding() > 0 ||
-           !ctx->cxi_pending_atomics.empty()) {
-      if (cxi_retire_ctx(*ctx, acked_wrs_, 64) == 0) {
-        if (!ctx_.progress_run.load(std::memory_order_acquire)) return;
-        cpu_relax();
+    {
+      StallReporter stall("barrier_drain", cfg_.rank, cfg_.thread_idx,
+                          dst_rank);
+      while (ctx->cxi_transport->outstanding() > 0 ||
+             !ctx->cxi_pending_atomics.empty()) {
+        if (cxi_retire_ctx(*ctx, acked_wrs_, 64) == 0) {
+          if (!ctx_.progress_run.load(std::memory_order_acquire)) return;
+          cpu_relax();
+        }
+        stall.tick("outstanding=%zu pending_atomics=%zu",
+                   ctx->cxi_transport->outstanding(),
+                   ctx->cxi_pending_atomics.size());
       }
     }
+    StallReporter stall("barrier_inject", cfg_.rank, cfg_.thread_idx,
+                        dst_rank);
     while (ctx->cxi_transport->try_inject_atomic_add64(
                ctx->cxi_peer_addr, 1, cxi_barrier_slot_offset(slot),
                ctx->cxi_remote_host_key) == -FI_EAGAIN) {
       if (cxi_retire_ctx(*ctx, acked_wrs_, 64) == 0) cpu_relax();
+      stall.tick("slot=%d", slot);
     }
   } else {
     ctx->cxi_transport->inject_atomic_add64(ctx->cxi_peer_addr, 1,
