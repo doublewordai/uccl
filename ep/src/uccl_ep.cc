@@ -24,10 +24,13 @@
 #include <nanobind/stl/vector.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -355,11 +358,34 @@ class Buffer {
             device_index, low_latency_mode);
         num_d2h_channel_addrs = static_cast<int>(host_addrs.size());
         if (num_d2h_channel_addrs > 0) {
-          CUDA_CHECK(cudaMallocManaged(
-              &d_handle_objs, num_d2h_channel_addrs * sizeof(d2hq::D2HHandle)));
-
-          CUDA_CHECK(cudaMallocManaged(
-              &d_handles, num_d2h_channel_addrs * sizeof(uint64_t)));
+          // Wild-write trap (2026-06-12): a GPU coredump caught
+          // cached_notify faulting on a D2HHandle whose FifoDeviceHandle
+          // tail pointer had been ZEROED in place — some writer sweeps
+          // zeros over control metadata (the same corruption class behind
+          // the missing/garbled count exchanges). The handles are strictly
+          // read-only after init, so place both arrays in their own
+          // page-aligned managed window and mprotect it PROT_READ: a host
+          // wild-writer dies with a SIGSEGV backtrace at the write, a
+          // device wild-writer faults in the WRITING kernel's coredump
+          // instead of the victim's. If mprotect rejects managed memory
+          // the trap degrades to detection-only via the snapshot check in
+          // uccl_check_d2h_handles().
+          size_t const page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+          size_t const objs_bytes =
+              num_d2h_channel_addrs * sizeof(d2hq::D2HHandle);
+          size_t const addrs_bytes = num_d2h_channel_addrs * sizeof(uint64_t);
+          size_t const window_bytes =
+              ((objs_bytes + addrs_bytes + page - 1) / page) * page;
+          CUDA_CHECK(cudaMallocManaged(&d_handle_window_alloc,
+                                       window_bytes + 2 * page));
+          uintptr_t const aligned =
+              (reinterpret_cast<uintptr_t>(d_handle_window_alloc) + page - 1) &
+              ~(page - 1);
+          d_handle_objs = reinterpret_cast<d2hq::D2HHandle*>(aligned);
+          d_handles =
+              reinterpret_cast<uint64_t*>(aligned + objs_bytes);
+          d_handle_window = reinterpret_cast<void*>(aligned);
+          d_handle_window_bytes = window_bytes;
 
           for (int i = 0; i < num_d2h_channel_addrs; ++i) {
 #ifndef USE_MSCCLPP_FIFO_BACKEND
@@ -405,6 +431,26 @@ class Buffer {
               device_index));
 #endif
           CUDA_CHECK(cudaDeviceSynchronize());
+
+          // Arm the wild-write trap: snapshot for the detection fallback,
+          // then try to make the window read-only.
+          d_handle_snapshot.assign(
+              reinterpret_cast<uint8_t*>(d_handle_window),
+              reinterpret_cast<uint8_t*>(d_handle_window) + objs_bytes +
+                  addrs_bytes);
+          if (mprotect(d_handle_window, d_handle_window_bytes, PROT_READ) ==
+              0) {
+            d_handle_protected = true;
+            fprintf(stderr,
+                    "[d2h-handle-trap] window %p (+%zu) mprotect(PROT_READ) "
+                    "armed\n",
+                    d_handle_window, d_handle_window_bytes);
+          } else {
+            fprintf(stderr,
+                    "[d2h-handle-trap] mprotect failed (%s); falling back to "
+                    "snapshot detection only\n",
+                    strerror(errno));
+          }
         }
         // Allocate device memory for IPC base pointers
         CUDA_CHECK(
@@ -648,13 +694,17 @@ class Buffer {
 
     // Free chunked mode staffs
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_expert_counter)));
-    // Free D2HHandle device-side arrays if allocated
-    if (d_handle_objs) {
-      CUDA_CHECK(cudaFree(d_handle_objs));
+    // Free the D2HHandle window if allocated (handles + addresses live in
+    // one mprotect'd managed window; unprotect before freeing).
+    if (d_handle_window_alloc) {
+      if (d_handle_protected) {
+        mprotect(d_handle_window, d_handle_window_bytes,
+                 PROT_READ | PROT_WRITE);
+      }
+      CUDA_CHECK(cudaFree(d_handle_window_alloc));
+      d_handle_window_alloc = nullptr;
       d_handle_objs = nullptr;
-    }
-    if (d_handles) {
-      CUDA_CHECK(cudaFree(d_handles));
+      d_handles = nullptr;
     }
     if (comm_stream != nullptr) {
       CUDA_CHECK(cudaStreamDestroy(comm_stream));
@@ -992,11 +1042,17 @@ class Buffer {
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - start_time)
                 .count() > get_cpu_timeout_secs(NUM_CPU_TIMEOUT_SECS)) {
+          check_d2h_handles("dispatch-cpu-timeout");
           throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
         }
       }
       num_recv_tokens_per_expert_list = std::vector<int>(
           moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
+    }
+    // Wild-write trap detection fallback: cheap periodic verification of
+    // the read-only handle window (no-op when mprotect armed and intact).
+    if ((++d_handle_check_counter & 0x3F) == 0) {
+      check_d2h_handles("dispatch-periodic");
     }
 
     std::optional<EventHandle> event;
@@ -1748,6 +1804,36 @@ class Buffer {
   int num_d2h_channel_addrs{0};
   d2hq::D2HHandle* d_handle_objs{nullptr};
   uint64_t* d_handles{nullptr};
+  // Wild-write trap state (see allocation site): the two arrays above
+  // live inside one page-aligned managed window, read-only after init.
+  void* d_handle_window_alloc{nullptr};
+  void* d_handle_window{nullptr};
+  size_t d_handle_window_bytes{0};
+  bool d_handle_protected{false};
+  std::vector<uint8_t> d_handle_snapshot;
+  uint64_t d_handle_check_counter{0};
+
+  // Detection fallback: compare the live window against the post-init
+  // snapshot; report the first divergence with offsets and values.
+  void check_d2h_handles(char const* where) {
+    if (d_handle_snapshot.empty() || !d_handle_window) return;
+    auto const* live = reinterpret_cast<uint8_t const*>(d_handle_window);
+    size_t const n = d_handle_snapshot.size();
+    if (memcmp(live, d_handle_snapshot.data(), n) == 0) return;
+    for (size_t off = 0; off < n; off += 8) {
+      uint64_t lv, sv;
+      memcpy(&lv, live + off, sizeof(lv));
+      memcpy(&sv, d_handle_snapshot.data() + off, sizeof(sv));
+      if (lv != sv) {
+        fprintf(stderr,
+                "[d2h-handle-trap] CORRUPTION at %s: window+0x%zx was "
+                "0x%llx now 0x%llx (handle %zu field %zu)\n",
+                where, off, (unsigned long long)sv, (unsigned long long)lv,
+                off / sizeof(d2hq::D2HHandle),
+                (off % sizeof(d2hq::D2HHandle)) / 8);
+      }
+    }
+  }
 
   // IPC base pointers for GPU access (for replacing nvshmemi_get_p2p_ptr)
   void** d_ipc_rdma_base_ptrs{
