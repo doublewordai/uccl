@@ -409,18 +409,31 @@ class Buffer {
 #endif
           }
 
-          // Trap run 2 learned: device writes to DEVICE-RESIDENT managed
-          // pages bypass the host PTE protection (the handle was zeroed
-          // through PROT_READ with no fault). Pin the window host-resident
-          // instead of prefetching to device — GH200 ATS then enforces the
-          // host page permissions for device accesses too, so a device
-          // wild-writer faults AT THE WRITE. Handle reads from device go
-          // over C2C; this path already round-trips host-mapped FIFO
-          // memory, so the added latency is immaterial for the hunt.
-          CUDA_CHECK(cudaMemAdvise(d_handle_window_alloc,
-                                   window_bytes + 2 * page,
-                                   cudaMemAdviseSetPreferredLocation,
-                                   cudaCpuDeviceId));
+          // Trap history: v1 (device-resident + mprotect) saw the handle
+          // zeroed through PROT_READ — device writes to device-resident
+          // managed pages bypass host PTEs, so the writer is a DEVICE
+          // kernel. v2 pinned the window host-resident so ATS would
+          // enforce the protection, but 6 conc-2048 waves then ran clean:
+          // the added C2C latency on every FIFO-handle read perturbs the
+          // race the same way CUDA_LAUNCH_BLOCKING did. v3 restores
+          // device residency (reproduces) and relies on the 10ms host
+          // watchdog (remote reads, non-perturbing) for first-corruption
+          // timestamps plus FULL-memory coredumps for post-mortem sweep
+          // forensics at the victim fault.
+          bool const pin_host =
+              std::getenv("UCCL_D2H_TRAP_HOST_PIN") != nullptr;
+          if (pin_host) {
+            CUDA_CHECK(cudaMemAdvise(d_handle_window_alloc,
+                                     window_bytes + 2 * page,
+                                     cudaMemAdviseSetPreferredLocation,
+                                     cudaCpuDeviceId));
+          } else {
+            cudaMemLocation loc;
+            loc.type = cudaMemLocationTypeDevice;
+            loc.id = device_index;
+            CUDA_CHECK(cudaMemPrefetchAsync(d_handle_window,
+                                            d_handle_window_bytes, loc, 0));
+          }
           CUDA_CHECK(cudaDeviceSynchronize());
 
           // Arm the wild-write trap: snapshot for the detection fallback,
