@@ -378,11 +378,27 @@ class Buffer {
           size_t const addrs_bytes = num_d2h_channel_addrs * sizeof(uint64_t);
           size_t const window_bytes =
               ((objs_bytes + addrs_bytes + page - 1) / page) * page;
-          CUDA_CHECK(cudaMallocManaged(&d_handle_window_alloc,
-                                       window_bytes + 2 * page));
-          uintptr_t const aligned =
+          // Canary v4: the sweep's geometry is the missing evidence. Wrap
+          // the handle page with self-describing canary regions (each
+          // qword = kCanaryMagic ^ its absolute address) so any zero/garbage
+          // sweep that touches the neighborhood reports its exact extent.
+          size_t const canary_bytes = size_t{2} << 20;  // 2MB each side
+          CUDA_CHECK(cudaMallocManaged(
+              &d_handle_window_alloc,
+              2 * canary_bytes + window_bytes + 2 * page));
+          uintptr_t const canary_lo_base =
               (reinterpret_cast<uintptr_t>(d_handle_window_alloc) + page - 1) &
               ~(page - 1);
+          uintptr_t const aligned = canary_lo_base + canary_bytes;
+          d_canary_lo = reinterpret_cast<uint64_t*>(canary_lo_base);
+          d_canary_hi = reinterpret_cast<uint64_t*>(aligned + window_bytes);
+          d_canary_qwords = canary_bytes / sizeof(uint64_t);
+          for (size_t q = 0; q < d_canary_qwords; ++q) {
+            d_canary_lo[q] =
+                kCanaryMagic ^ reinterpret_cast<uintptr_t>(d_canary_lo + q);
+            d_canary_hi[q] =
+                kCanaryMagic ^ reinterpret_cast<uintptr_t>(d_canary_hi + q);
+          }
           d_handle_objs = reinterpret_cast<d2hq::D2HHandle*>(aligned);
           d_handles =
               reinterpret_cast<uint64_t*>(aligned + objs_bytes);
@@ -424,15 +440,16 @@ class Buffer {
               std::getenv("UCCL_D2H_TRAP_HOST_PIN") != nullptr;
           if (pin_host) {
             CUDA_CHECK(cudaMemAdvise(d_handle_window_alloc,
-                                     window_bytes + 2 * page,
+                                     2 * canary_bytes + window_bytes + 2 * page,
                                      cudaMemAdviseSetPreferredLocation,
                                      cudaCpuDeviceId));
           } else {
             cudaMemLocation loc;
             loc.type = cudaMemLocationTypeDevice;
             loc.id = device_index;
-            CUDA_CHECK(cudaMemPrefetchAsync(d_handle_window,
-                                            d_handle_window_bytes, loc, 0));
+            CUDA_CHECK(cudaMemPrefetchAsync(
+                reinterpret_cast<void*>(canary_lo_base),
+                2 * canary_bytes + window_bytes, loc, 0));
           }
           CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -1818,6 +1835,41 @@ class Buffer {
   bool d_handle_protected{false};
   std::vector<uint8_t> d_handle_snapshot;
   uint64_t d_handle_check_counter{0};
+  // Canary v4: self-describing guard regions around the handle page.
+  static constexpr uint64_t kCanaryMagic = 0xA5C3A5C3A5C3A5C3ull;
+  uint64_t* d_canary_lo{nullptr};
+  uint64_t* d_canary_hi{nullptr};
+  size_t d_canary_qwords{0};
+
+  // Scan one canary region; report the divergence extent (the sweep's
+  // geometry: first/last offset + sample values fingerprint the writer).
+  bool scan_canary(char const* name, uint64_t* base) {
+    if (!base || d_canary_qwords == 0) return false;
+    size_t first = SIZE_MAX, last = 0, count = 0;
+    uint64_t sample_val = 0;
+    size_t sample_off = 0;
+    for (size_t q = 0; q < d_canary_qwords; ++q) {
+      uint64_t const expect =
+          kCanaryMagic ^ reinterpret_cast<uintptr_t>(base + q);
+      uint64_t const got = base[q];
+      if (got != expect) {
+        if (first == SIZE_MAX) {
+          first = q;
+          sample_val = got;
+          sample_off = q;
+        }
+        last = q;
+        ++count;
+      }
+    }
+    if (first == SIZE_MAX) return false;
+    fprintf(stderr,
+            "[d2h-canary] SWEEP through %s canary (%p): %zu qwords differ, "
+            "byte range +0x%zx..+0x%zx, first value 0x%llx at +0x%zx\n",
+            name, (void*)base, count, first * 8, last * 8 + 7,
+            (unsigned long long)sample_val, sample_off * 8);
+    return true;
+  }
 
   // Detection fallback: compare the live window against the post-init
   // snapshot; report the sweep shape (first/last divergent offsets
@@ -1861,18 +1913,22 @@ class Buffer {
     if (d_handle_watchdog.joinable() || d_handle_snapshot.empty()) return;
     d_handle_watchdog_stop.store(false);
     d_handle_watchdog = std::thread([this] {
-      bool reported = false;
+      bool reported_handles = false;
+      bool reported_lo = false, reported_hi = false;
       while (!d_handle_watchdog_stop.load(std::memory_order_acquire)) {
-        if (!reported && !d_handle_snapshot.empty() && d_handle_window) {
+        if (!reported_handles && !d_handle_snapshot.empty() &&
+            d_handle_window) {
           auto const* live =
               reinterpret_cast<uint8_t const*>(d_handle_window);
           if (memcmp(live, d_handle_snapshot.data(),
                      d_handle_snapshot.size()) != 0) {
             check_d2h_handles("watchdog");
-            reported = true;  // one full report; keep thread to hold state
+            reported_handles = true;
           }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!reported_lo) reported_lo = scan_canary("lo", d_canary_lo);
+        if (!reported_hi) reported_hi = scan_canary("hi", d_canary_hi);
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
       }
     });
   }
