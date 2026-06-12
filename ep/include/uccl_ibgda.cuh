@@ -409,6 +409,14 @@ __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(
       }
     }
 #endif
+    // NOTE: single-proxy barrier is intentional. The barrier is a
+    // cross-rank rendezvous; one rendezvous per rank suffices, and the
+    // proxy-side barrier protocol is not validated for concurrent
+    // barriers from multiple proxies (fanning it out regressed boot:
+    // corrupted notify counters). Global write-fencing is provided by
+    // nvshmemi_ibgda_quiet, which DOES fan out to every proxy, running
+    // before this barrier in notify_dispatch.
+    break;
   }
 
   // Then wait for each proxy’s barrier to complete
