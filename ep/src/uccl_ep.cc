@@ -25,10 +25,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <thread>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <mutex>
@@ -407,29 +409,18 @@ class Buffer {
 #endif
           }
 
-          // Prefetch so the device immediately sees initialized contents
-#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__) && \
-    CUDA_VERSION >= 12000
-          // CUDA 12+: cudaMemPrefetchAsync(ptr, count, cudaMemLocation, flags,
-          // stream)
-          cudaMemLocation loc;
-          loc.type = cudaMemLocationTypeDevice;
-          loc.id = device_index;
-          CUDA_CHECK(cudaMemPrefetchAsync(
-              d_handle_objs, num_d2h_channel_addrs * sizeof(d2hq::D2HHandle),
-              loc, 0));
-          CUDA_CHECK(cudaMemPrefetchAsync(
-              d_handles, num_d2h_channel_addrs * sizeof(uint64_t), loc, 0));
-#else
-          // CUDA 11.x / HIP: cudaMemPrefetchAsync(ptr, count, dstDevice,
-          // stream)
-          CUDA_CHECK(cudaMemPrefetchAsync(
-              d_handle_objs, num_d2h_channel_addrs * sizeof(d2hq::D2HHandle),
-              device_index, 0));
-          CUDA_CHECK(cudaMemPrefetchAsync(
-              d_handles, num_d2h_channel_addrs * sizeof(uint64_t),
-              device_index));
-#endif
+          // Trap run 2 learned: device writes to DEVICE-RESIDENT managed
+          // pages bypass the host PTE protection (the handle was zeroed
+          // through PROT_READ with no fault). Pin the window host-resident
+          // instead of prefetching to device — GH200 ATS then enforces the
+          // host page permissions for device accesses too, so a device
+          // wild-writer faults AT THE WRITE. Handle reads from device go
+          // over C2C; this path already round-trips host-mapped FIFO
+          // memory, so the added latency is immaterial for the hunt.
+          CUDA_CHECK(cudaMemAdvise(d_handle_window_alloc,
+                                   window_bytes + 2 * page,
+                                   cudaMemAdviseSetPreferredLocation,
+                                   cudaCpuDeviceId));
           CUDA_CHECK(cudaDeviceSynchronize());
 
           // Arm the wild-write trap: snapshot for the detection fallback,
@@ -451,6 +442,7 @@ class Buffer {
                     "snapshot detection only\n",
                     strerror(errno));
           }
+          start_d2h_watchdog();
         }
         // Allocate device memory for IPC base pointers
         CUDA_CHECK(
@@ -696,6 +688,7 @@ class Buffer {
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_expert_counter)));
     // Free the D2HHandle window if allocated (handles + addresses live in
     // one mprotect'd managed window; unprotect before freeing).
+    stop_d2h_watchdog();
     if (d_handle_window_alloc) {
       if (d_handle_protected) {
         mprotect(d_handle_window, d_handle_window_bytes,
@@ -1814,25 +1807,66 @@ class Buffer {
   uint64_t d_handle_check_counter{0};
 
   // Detection fallback: compare the live window against the post-init
-  // snapshot; report the first divergence with offsets and values.
+  // snapshot; report the sweep shape (first/last divergent offsets
+  // fingerprint the writer's loop) plus the first few diffs.
   void check_d2h_handles(char const* where) {
     if (d_handle_snapshot.empty() || !d_handle_window) return;
     auto const* live = reinterpret_cast<uint8_t const*>(d_handle_window);
     size_t const n = d_handle_snapshot.size();
     if (memcmp(live, d_handle_snapshot.data(), n) == 0) return;
+    size_t first = n, last = 0, count = 0, printed = 0;
     for (size_t off = 0; off < n; off += 8) {
       uint64_t lv, sv;
       memcpy(&lv, live + off, sizeof(lv));
       memcpy(&sv, d_handle_snapshot.data() + off, sizeof(sv));
       if (lv != sv) {
-        fprintf(stderr,
-                "[d2h-handle-trap] CORRUPTION at %s: window+0x%zx was "
-                "0x%llx now 0x%llx (handle %zu field %zu)\n",
-                where, off, (unsigned long long)sv, (unsigned long long)lv,
-                off / sizeof(d2hq::D2HHandle),
-                (off % sizeof(d2hq::D2HHandle)) / 8);
+        if (off < first) first = off;
+        last = off;
+        ++count;
+        if (printed < 8) {
+          fprintf(stderr,
+                  "[d2h-handle-trap] CORRUPTION at %s: window+0x%zx was "
+                  "0x%llx now 0x%llx (handle %zu field %zu)\n",
+                  where, off, (unsigned long long)sv, (unsigned long long)lv,
+                  off / sizeof(d2hq::D2HHandle),
+                  (off % sizeof(d2hq::D2HHandle)) / 8);
+          ++printed;
+        }
       }
     }
+    fprintf(stderr,
+            "[d2h-handle-trap] sweep summary at %s: %zu qwords differ, "
+            "range window+0x%zx .. +0x%zx (window=%p)\n",
+            where, count, first, last, d_handle_window);
+  }
+
+  // 10ms watchdog so corruption is timestamped close to the writing
+  // step rather than discovered at the next quiet/barrier fault.
+  std::thread d_handle_watchdog;
+  std::atomic<bool> d_handle_watchdog_stop{false};
+  void start_d2h_watchdog() {
+    if (d_handle_watchdog.joinable() || d_handle_snapshot.empty()) return;
+    d_handle_watchdog_stop.store(false);
+    d_handle_watchdog = std::thread([this] {
+      bool reported = false;
+      while (!d_handle_watchdog_stop.load(std::memory_order_acquire)) {
+        if (!reported && !d_handle_snapshot.empty() && d_handle_window) {
+          auto const* live =
+              reinterpret_cast<uint8_t const*>(d_handle_window);
+          if (memcmp(live, d_handle_snapshot.data(),
+                     d_handle_snapshot.size()) != 0) {
+            check_d2h_handles("watchdog");
+            reported = true;  // one full report; keep thread to hold state
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    });
+  }
+  void stop_d2h_watchdog() {
+    if (!d_handle_watchdog.joinable()) return;
+    d_handle_watchdog_stop.store(true);
+    d_handle_watchdog.join();
   }
 
   // IPC base pointers for GPU access (for replacing nvshmemi_get_p2p_ptr)
