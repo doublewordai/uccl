@@ -43,71 +43,6 @@ std::map<ProxyRegistryKey, std::vector<nb::object>>& proxies_by_dev() {
 }
 }  // namespace uccl
 
-namespace {
-// Post-mortem summary for a dispatch-CPU timeout: host-mapped counter
-// state plus a per-RDMA-peer arrival map read back from the
-// count-exchange recv region. The region is sentinel-filled with -1
-// before notify_dispatch, so a slot still holding -1 proves that peer's
-// counts never arrived this round, separating "peer never entered the
-// collective" (scheduling desync) from "counts sent but lost"
-// (transport). Device readback runs on a fresh non-blocking stream with
-// a bounded wait so a wedged comm stream cannot hang the error path.
-std::string dispatch_timeout_debug(int rank, int num_rdma_ranks,
-                                   int num_local_experts,
-                                   int volatile const* moe_recv_counter,
-                                   int volatile const* moe_recv_rdma_counter,
-                                   int volatile const* moe_recv_expert_counter,
-                                   void const* counts_recv_region,
-                                   int counts_slot_ints) {
-  std::string msg = " [rank=" + std::to_string(rank) +
-                    " moe_recv_counter=" + std::to_string(*moe_recv_counter) +
-                    " moe_recv_rdma_counter=" +
-                    std::to_string(*moe_recv_rdma_counter) +
-                    " expert_counters=";
-  for (int i = 0; i < num_local_experts; ++i)
-    msg += (i ? "," : "[") + std::to_string(moe_recv_expert_counter[i]);
-  msg += "]";
-
-  std::vector<int> host_counts(
-      static_cast<size_t>(num_rdma_ranks) * counts_slot_ints, -2);
-  cudaStream_t debug_stream = nullptr;
-  bool copied = false;
-  if (cudaStreamCreateWithFlags(&debug_stream, cudaStreamNonBlocking) ==
-      cudaSuccess) {
-    if (cudaMemcpyAsync(host_counts.data(), counts_recv_region,
-                        host_counts.size() * sizeof(int),
-                        cudaMemcpyDeviceToHost, debug_stream) == cudaSuccess) {
-      auto deadline = std::chrono::high_resolution_clock::now() +
-                      std::chrono::seconds(2);
-      while (std::chrono::high_resolution_clock::now() < deadline) {
-        auto status = cudaStreamQuery(debug_stream);
-        if (status == cudaSuccess) {
-          copied = true;
-          break;
-        }
-        if (status != cudaErrorNotReady) break;
-      }
-    }
-    cudaStreamDestroy(debug_stream);
-    static_cast<void>(cudaGetLastError());  // clear any sticky probe error
-  }
-  if (!copied) return msg + " recv-count slots unreadable]";
-
-  // Each peer's whole slot arrives as a single RDMA put; the trailing int
-  // is that peer's per-RDMA-rank token count. -1 == sentinel == missing.
-  msg += " counts_from_rdma_rank=";
-  for (int r = 0; r < num_rdma_ranks; ++r) {
-    int const* slot = host_counts.data() +
-                      static_cast<size_t>(r) * counts_slot_ints;
-    int const rdma_tokens = slot[counts_slot_ints - 1];
-    msg += (r ? "," : "{") + std::to_string(r) + ":" +
-           (rdma_tokens == -1 ? std::string("MISSING")
-                              : std::to_string(rdma_tokens));
-  }
-  return msg + "}]";
-}
-}  // namespace
-
 #define NUM_MAX_LOCAL_EXPERTS 1024
 
 namespace nb = nanobind;
@@ -797,13 +732,7 @@ class Buffer {
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - start_time)
                 .count() > get_cpu_timeout_secs(NUM_CPU_TIMEOUT_SECS)) {
-          std::string msg =
-              "DeepEP error: CPU recv timeout [rank=" + std::to_string(rank) +
-              " moe_recv_counter=" + std::to_string(*moe_recv_counter) +
-              " expert_counters=";
-          for (int i = 0; i < num_local_experts; ++i)
-            msg += (i ? "," : "[") + std::to_string(moe_recv_expert_counter[i]);
-          throw std::runtime_error(msg + "]]");
+          throw std::runtime_error("DeepEP error: CPU recv timeout");
         }
       }
       num_recv_tokens_per_expert_list = std::vector<int>(
@@ -1019,24 +948,6 @@ class Buffer {
     *moe_recv_rdma_counter = -1;
     for (int i = 0; i < num_local_experts; ++i) moe_recv_expert_counter[i] = -1;
 
-    // Sentinel-fill the count-exchange recv region (the recv half of the
-    // rdma_recv_num_tokens_mixed SymBuffer at the start of rdma_buffer) so
-    // that on a CPU timeout below, slots still holding -1 identify exactly
-    // which RDMA peers' counts never arrived this round. The region is
-    // never cleaned between rounds, so without this, stale previous-round
-    // values are indistinguishable from fresh arrivals. Ordering is safe:
-    // this clear precedes notify_dispatch on comm_stream, and a peer only
-    // puts into this region after our kernel passes its entry barrier.
-    int const num_rdma_ranks = get_num_rdma_ranks();
-    int const counts_slot_ints =
-        NUM_MAX_NVL_PEERS + num_experts / num_rdma_ranks + 1;
-    size_t const counts_half_bytes =
-        sizeof(int) * static_cast<size_t>(num_rdma_ranks) * counts_slot_ints;
-    void* counts_recv_region =
-        static_cast<char*>(rdma_buffer_ptr) + counts_half_bytes;
-    CUDA_CHECK(cudaMemsetAsync(counts_recv_region, 0xFF, counts_half_bytes,
-                               comm_stream));
-
     uccl::internode::notify_dispatch(
         reinterpret_cast<int const*>(num_tokens_per_rank_ptr),
         moe_recv_counter_mapped, num_ranks,
@@ -1081,12 +992,7 @@ class Buffer {
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - start_time)
                 .count() > get_cpu_timeout_secs(NUM_CPU_TIMEOUT_SECS)) {
-          throw std::runtime_error(
-              "DeepEP error: timeout (dispatch CPU)" +
-              dispatch_timeout_debug(rank, num_rdma_ranks, num_local_experts,
-                                     moe_recv_counter, moe_recv_rdma_counter,
-                                     moe_recv_expert_counter,
-                                     counts_recv_region, counts_slot_ints));
+          throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
         }
       }
       num_recv_tokens_per_expert_list = std::vector<int>(
