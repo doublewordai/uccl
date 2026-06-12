@@ -1337,6 +1337,13 @@ void Proxy::quiet_cq() {
 
 void Proxy::drain_rings_for_quiet() {
 #ifdef USE_MSCCLPP_FIFO_BACKEND
+  // A/B control for validation: UCCL_QUIET_RING_DRAIN=0 disables the
+  // pipeline half of the fence (reverts to transport-only quiet).
+  static bool const enabled = [] {
+    char const* v = std::getenv("UCCL_QUIET_RING_DRAIN");
+    return !(v && v[0] == '0');
+  }();
+  if (!enabled) return;
   // The quiet fence has two halves. quiet_cq() drains the TRANSPORT
   // (posted writes + deferred atomics), but commands still parked in this
   // proxy's rings are invisible to it: the per-ring take budget
