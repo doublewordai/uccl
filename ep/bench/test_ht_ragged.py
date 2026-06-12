@@ -101,6 +101,7 @@ def main():
     parser.add_argument("--trials", type=int, default=120)
     parser.add_argument("--chaos-iters", type=int, default=400)
     parser.add_argument("--layers-per-step", type=int, default=8)
+    parser.add_argument("--r3-iters", type=int, default=150)
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -254,6 +255,62 @@ def main():
     dist.barrier(group)
     if rank == 0:
         print("[ragged] phase R2 OK", flush=True)
+
+    # Phase R3: sustained prefill-scale ragged pressure (2026-06-12 wedge:
+    # at conc-1024 the server dies ~8 min into the prefill ramp at dispatch
+    # seq ~186 -- one rank's count RDMA never arrives while every proxy
+    # ring stalls on the barrier). The trigger population is sustained
+    # LARGE eager dispatches: per-rank token counts in the hundreds to
+    # thousands, different on every rank, layer after layer with no syncs,
+    # while decode-shaped graph replays keep background traffic on the
+    # same proxy rings. Volume is what pushes the CXI TX queues into their
+    # EAGAIN/cap-wait paths, so R3 sends real prefill-sized payloads.
+    GOAL_WEDGE_SHAPE = [1144, 1146, 3198, 128, 128, 1141, 2169, 1143]
+    rng3 = random.Random(4242)  # same schedule on all ranks
+
+    def r3_shape():
+        out = []
+        for _r in range(num_ranks):
+            u = rng3.random()
+            if u < 0.35:
+                out.append(rng3.randrange(1024, 3300))
+            elif u < 0.70:
+                out.append(rng3.randrange(96, 1024))
+            elif u < 0.90:
+                out.append(rng3.randrange(1, 96))
+            else:
+                out.append(0)
+        return out
+
+    if rank == 0:
+        print(f"[ragged] phase R3: {args.r3_iters} sustained prefill-scale "
+              f"iters x {args.layers_per_step} layers", flush=True)
+    for it in range(args.r3_iters):
+        if it % 13 == 12:
+            shape = GOAL_WEDGE_SHAPE
+        else:
+            shape = r3_shape()
+        # background decode replays racing the eager traffic on the rings
+        if it % 3 == 0:
+            graphs[cap_shapes[it % len(cap_shapes)]][0].replay()
+        for _layer in range(args.layers_per_step):
+            run_eager_step(
+                buffer, rank, shape[rank], args.hidden, args.num_experts,
+                args.num_topk, config, combine_config,
+                seed=20000 + it * args.layers_per_step + _layer,
+                check=(_layer == 0 and it % 20 == 19),
+            )
+        if it % 20 == 19:
+            torch.cuda.synchronize()
+            dist.barrier(group)
+            if rank == 0:
+                print(f"[ragged] phase R3: {it + 1}/{args.r3_iters}",
+                      flush=True)
+    torch.cuda.synchronize()
+    dist.barrier(group)
+    if rank == 0:
+        print("[ragged] phase R3 OK", flush=True)
+
     for s in cap_shapes:
         del graphs[s]
     graphs.clear()
