@@ -330,7 +330,7 @@ __device__ static __forceinline__ void nvshmemi_ibgda_quiet(
   // CXI work is sharded across every D2H ring. A QUIET on one
   // ring per proxy only fences commands that were already posted to the
   // transport from that ring, not commands still queued on sibling rings.
-#if defined(USE_LIBFABRIC_CXI) && !defined(USE_MSCCLPP_FIFO_BACKEND)
+#if defined(USE_LIBFABRIC_CXI)
   constexpr int kQuietStride = 1;
   constexpr int kMaxQuietPosts = kNumProxyThs * kChannelPerProxy;
 #else
