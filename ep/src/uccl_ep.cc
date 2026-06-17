@@ -385,12 +385,16 @@ class Buffer {
             device_index, low_latency_mode);
         num_d2h_channel_addrs = static_cast<int>(host_addrs.size());
         if (num_d2h_channel_addrs > 0) {
-          CUDA_CHECK(cudaMallocManaged(
-              &d_handle_objs, num_d2h_channel_addrs * sizeof(d2hq::D2HHandle)));
+          size_t const handle_objs_bytes =
+              num_d2h_channel_addrs * sizeof(d2hq::D2HHandle);
+          size_t const handle_ptrs_bytes =
+              num_d2h_channel_addrs * sizeof(uint64_t);
+          CUDA_CHECK(cudaMalloc(&d_handle_objs, handle_objs_bytes));
+          CUDA_CHECK(cudaMalloc(&d_handles, handle_ptrs_bytes));
 
-          CUDA_CHECK(cudaMallocManaged(
-              &d_handles, num_d2h_channel_addrs * sizeof(uint64_t)));
-
+          std::vector<d2hq::D2HHandle> host_handle_objs(
+              num_d2h_channel_addrs);
+          std::vector<uint64_t> host_handles(num_d2h_channel_addrs);
           for (int i = 0; i < num_d2h_channel_addrs; ++i) {
 #ifndef USE_MSCCLPP_FIFO_BACKEND
             void* host_ptr = reinterpret_cast<void*>(host_addrs[i]);
@@ -401,40 +405,20 @@ class Buffer {
 #else
             dev_ptr = host_ptr;
 #endif
-            d_handle_objs[i].init_from_dev_ptr(dev_ptr);
-            d_handles[i] = reinterpret_cast<uint64_t>(&d_handle_objs[i]);
+            host_handle_objs[i].init_from_dev_ptr(dev_ptr);
+            host_handles[i] = reinterpret_cast<uint64_t>(&d_handle_objs[i]);
 #else
             auto* fifo = reinterpret_cast<mscclpp::Fifo*>(host_addrs[i]);
             mscclpp::FifoDeviceHandle h = fifo->deviceHandle();
-            d_handle_objs[i].init_from_host_value(h);
-            d_handles[i] = reinterpret_cast<uint64_t>(d_handle_objs + i);
+            host_handle_objs[i].init_from_host_value(h);
+            host_handles[i] = reinterpret_cast<uint64_t>(d_handle_objs + i);
 #endif
           }
 
-          // Prefetch so the device immediately sees initialized contents
-#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__) && \
-    CUDA_VERSION >= 12000
-          // CUDA 12+: cudaMemPrefetchAsync(ptr, count, cudaMemLocation, flags,
-          // stream)
-          cudaMemLocation loc;
-          loc.type = cudaMemLocationTypeDevice;
-          loc.id = device_index;
-          CUDA_CHECK(cudaMemPrefetchAsync(
-              d_handle_objs, num_d2h_channel_addrs * sizeof(d2hq::D2HHandle),
-              loc, 0));
-          CUDA_CHECK(cudaMemPrefetchAsync(
-              d_handles, num_d2h_channel_addrs * sizeof(uint64_t), loc, 0));
-#else
-          // CUDA 11.x / HIP: cudaMemPrefetchAsync(ptr, count, dstDevice,
-          // stream)
-          CUDA_CHECK(cudaMemPrefetchAsync(
-              d_handle_objs, num_d2h_channel_addrs * sizeof(d2hq::D2HHandle),
-              device_index, 0));
-          CUDA_CHECK(cudaMemPrefetchAsync(
-              d_handles, num_d2h_channel_addrs * sizeof(uint64_t),
-              device_index));
-#endif
-          CUDA_CHECK(cudaDeviceSynchronize());
+          CUDA_CHECK(cudaMemcpy(d_handle_objs, host_handle_objs.data(),
+                                handle_objs_bytes, cudaMemcpyHostToDevice));
+          CUDA_CHECK(cudaMemcpy(d_handles, host_handles.data(),
+                                handle_ptrs_bytes, cudaMemcpyHostToDevice));
         }
         // Allocate device memory for IPC base pointers
         CUDA_CHECK(
