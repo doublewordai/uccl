@@ -128,7 +128,13 @@ void unmap_local_barrier_shm(std::string const& name, LocalBarrier* lb,
 }
 #endif
 
+static bool env_requests_cxi_transport() {
+  char const* transport = std::getenv("UCCL_EP_TRANSPORT");
+  return transport && std::string(transport) == "cxi";
+}
+
 Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
+  use_cxi_transport_ = env_requests_cxi_transport();
   // Unset (-1) device/NIC ranks fall back to local_rank.
   if (cfg_.device_index < 0) cfg_.device_index = cfg_.local_rank;
   if (cfg_.nic_local_rank < 0) cfg_.nic_local_rank = cfg_.local_rank;
@@ -153,10 +159,7 @@ double Proxy::avg_wr_latency_us() const {
 
 uint64_t Proxy::completed_wr() const { return completion_count_; }
 
-bool Proxy::use_cxi_transport() const {
-  char const* transport = std::getenv("UCCL_EP_TRANSPORT");
-  return transport && std::string(transport) == "cxi";
-}
+bool Proxy::use_cxi_transport() const { return use_cxi_transport_; }
 
 void Proxy::pin_thread_to_cpu_wrapper() {
   if (cfg_.pin_thread) {
@@ -853,13 +856,16 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
                                          std::memory_order_release);
       }
 
-      if (ctx_.quiet_wr != -1 && front_wr == (uint64_t)ctx_.quiet_wr) {
+      uint32_t const front_seq = static_cast<uint32_t>(front_wr);
+      if (ctx_.quiet_wr != -1 &&
+          front_seq == static_cast<uint32_t>(ctx_.quiet_wr)) {
         ctx_.quiet_inflight = false;
         ctx_.quiet_wr = -1;
         fifo->pop();
       }
 
-      if (ctx_.barrier_wr != -1 && front_wr == (uint64_t)ctx_.barrier_wr) {
+      if (ctx_.barrier_wr != -1 &&
+          front_seq == static_cast<uint32_t>(ctx_.barrier_wr)) {
         ctx_.barrier_inflight = false;
         ctx_.barrier_wr = -1;
         fifo->pop();
@@ -1782,7 +1788,8 @@ void Proxy::send_barrier(uint64_t wr) {
   if (ctx_.barrier_wr == -1) {
     ctx_.barrier_wr = wr;
   } else {
-    assert(use_cxi_transport() && static_cast<uint64_t>(ctx_.barrier_wr) == wr);
+    assert(use_cxi_transport() && static_cast<uint32_t>(ctx_.barrier_wr) ==
+                                      static_cast<uint32_t>(wr));
   }
   ctx_.barrier_seq = (ctx_.barrier_seq + 1) & BarrierImm::kSeqMask;
 
