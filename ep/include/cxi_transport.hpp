@@ -35,6 +35,8 @@ class CxiTransport final : public EpTransport {
   void post_barrier_atomic_add(int dst_rank, uint64_t wr_id, size_t slot,
                                uint64_t value);
   uint64_t load_barrier_word(size_t slot) const;
+  size_t pending_ops() const;
+  size_t free_atomic_operand_slots() const;
 
   int poll(TransportCompletion* out, int max) override;
   void destroy() override;

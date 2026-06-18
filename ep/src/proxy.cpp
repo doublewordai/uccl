@@ -2,6 +2,7 @@
 #include "bench_utils.hpp"
 #include "d2h_queue_host.hpp"
 #include "ep_util.hpp"
+#include "proxy_stall.hpp"
 #include "rdma.hpp"
 #include "util/util.h"
 #include <arpa/inet.h>  // for htonl, ntohl
@@ -379,7 +380,11 @@ void Proxy::init_common() {
           ctx_.lb->release_seq[i].store(0, std::memory_order_relaxed);
         }
       } else {
-        while (ctx_.lb->full_mask == 0ULL) cpu_relax();
+        StallReporter stall("barrier_shm_init", cfg_.rank, cfg_.thread_idx);
+        while (ctx_.lb->full_mask == 0ULL) {
+          stall.tick("full_mask=0");
+          cpu_relax();
+        }
       }
 #endif
     }
@@ -698,7 +703,11 @@ void Proxy::init_common() {
         ctx_.lb->release_seq[i].store(0, std::memory_order_relaxed);
       }
     } else {
-      while (ctx_.lb->full_mask == 0ULL) cpu_relax();
+      StallReporter stall("barrier_shm_init", cfg_.rank, cfg_.thread_idx);
+      while (ctx_.lb->full_mask == 0ULL) {
+        stall.tick("full_mask=0");
+        cpu_relax();
+      }
     }
 #endif
   }
@@ -832,6 +841,7 @@ void Proxy::run_dual() {
     if (cfg_.use_normal_mode) {
       barrier_check();
     }
+    stall_scan();
   }
 }
 
@@ -896,6 +906,183 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
 #endif
 
   adaptive_sleeper_.update_timer();
+}
+
+size_t Proxy::cxi_pending_ops_total() const {
+  size_t total = 0;
+  for (auto const& transport : cxi_transports_by_rank_) {
+    if (transport) total += transport->pending_ops();
+  }
+  return total;
+}
+
+size_t Proxy::cxi_free_atomic_operand_slots_total() const {
+  size_t total = 0;
+  for (auto const& transport : cxi_transports_by_rank_) {
+    if (transport) total += transport->free_atomic_operand_slots();
+  }
+  return total;
+}
+
+void Proxy::dump_barrier_state(char const* site) const {
+  char arrive[256] = {0};
+  char release[256] = {0};
+  size_t ap = 0;
+  size_t rp = 0;
+
+#ifndef USE_SUBSET_BARRIER
+  if (ctx_.lb) {
+    for (int lr = 0; lr < ctx_.num_local_ranks && lr < UCCL_MAX_LOCAL_RANKS;
+         ++lr) {
+      if (ap + 24 < sizeof(arrive)) {
+        ap += std::snprintf(
+            arrive + ap, sizeof(arrive) - ap, "%llu,",
+            static_cast<unsigned long long>(
+                ctx_.lb->arrive_seq[lr].load(std::memory_order_acquire)));
+      }
+      if (rp + 24 < sizeof(release)) {
+        rp += std::snprintf(
+            release + rp, sizeof(release) - rp, "%llu,",
+            static_cast<unsigned long long>(
+                ctx_.lb->release_seq[lr].load(std::memory_order_acquire)));
+      }
+    }
+  }
+#endif
+
+  uint64_t cxi_arrivals = 0;
+  uint64_t cxi_releases = 0;
+  if (use_cxi_transport()) {
+    cxi_arrivals = load_cxi_barrier_word_sum(/*slot=*/0);
+    cxi_releases = load_cxi_barrier_word_sum(/*slot=*/1);
+  }
+
+  std::fprintf(stderr,
+               "[proxy-barrier-state site=%s rank=%d thread=%d seq=%llu "
+               "wr=0x%llx leader=%d local_rank=%d inflight=%d "
+               "arrive=[%s] release=[%s] cxi_arrivals=%llu "
+               "cxi_releases=%llu cxi_outstanding=%zu cxi_pending=%zu "
+               "cxi_free_atomic_slots=%zu]\n",
+               site, cfg_.rank, cfg_.thread_idx,
+               static_cast<unsigned long long>(ctx_.barrier_seq),
+               static_cast<unsigned long long>(ctx_.barrier_wr),
+               static_cast<int>(cfg_.rank == ctx_.node_leader_rank),
+               ctx_.local_rank, static_cast<int>(ctx_.barrier_inflight),
+               arrive, release, static_cast<unsigned long long>(cxi_arrivals),
+               static_cast<unsigned long long>(cxi_releases),
+               cxi_outstanding_ops_, cxi_pending_ops_total(),
+               cxi_free_atomic_operand_slots_total());
+}
+
+void Proxy::stall_scan() {
+  if (!StallReporter::enabled()) return;
+  if ((++stall_scan_iter_ & 0x3FFull) != 0) return;
+
+  auto const now = std::chrono::steady_clock::now();
+
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+  if (stall_front_wr_.size() != cfg_.d2h_queues.size()) {
+    stall_front_wr_.assign(cfg_.d2h_queues.size(), ~0ull);
+    stall_front_since_.assign(cfg_.d2h_queues.size(), now);
+    stall_next_report_.assign(cfg_.d2h_queues.size(), now);
+  }
+
+  for (size_t rb = 0; rb < cfg_.d2h_queues.size(); ++rb) {
+    auto& pend = fifo_pending_[rb];
+    auto* fifo = cfg_.d2h_queues[rb].fifo;
+    size_t const backlog = fifo ? fifo->backlog() : 0;
+    if (pend.empty() && backlog == 0) {
+      stall_front_wr_[rb] = ~0ull;
+      continue;
+    }
+
+    uint64_t const front = pend.empty() ? ~1ull : pend.front().first;
+    if (stall_front_wr_[rb] != front) {
+      stall_front_wr_[rb] = front;
+      stall_front_since_[rb] = now;
+      stall_next_report_[rb] = now + std::chrono::seconds(3);
+      continue;
+    }
+    if (now < stall_next_report_[rb]) continue;
+
+    stall_next_report_[rb] = now + std::chrono::seconds(5);
+    auto const jam_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - stall_front_since_[rb])
+                            .count();
+    size_t const front_bytes = pend.empty() ? 0 : pend.front().second;
+    std::fprintf(stderr,
+                 "[proxy-ring-jam rank=%d thread=%d rb=%zu] "
+                 "front_wr=0x%llx front_bytes=%zu pend=%zu backlog=%zu "
+                 "jam_ms=%lld quiet_wr=0x%llx quiet_inflight=%d "
+                 "barrier_wr=0x%llx barrier_inflight=%d inflight_bytes=%zu "
+                 "cxi_outstanding=%zu cxi_pending=%zu]\n",
+                 cfg_.rank, cfg_.thread_idx, rb,
+                 static_cast<unsigned long long>(front), front_bytes,
+                 pend.size(), backlog, static_cast<long long>(jam_ms),
+                 static_cast<unsigned long long>(ctx_.quiet_wr),
+                 static_cast<int>(ctx_.quiet_inflight),
+                 static_cast<unsigned long long>(ctx_.barrier_wr),
+                 static_cast<int>(ctx_.barrier_inflight),
+                 current_inflight_bytes.load(std::memory_order_acquire),
+                 cxi_outstanding_ops_, cxi_pending_ops_total());
+    if (ctx_.barrier_inflight) dump_barrier_state("proxy-ring-jam");
+  }
+#endif
+
+  size_t const pending = cxi_pending_ops_total();
+  if (use_cxi_transport() && (cxi_outstanding_ops_ != 0 || pending != 0)) {
+    if (stall_cxi_seen_outstanding_ != cxi_outstanding_ops_ ||
+        stall_cxi_seen_pending_ != pending) {
+      stall_cxi_seen_outstanding_ = cxi_outstanding_ops_;
+      stall_cxi_seen_pending_ = pending;
+      stall_cxi_since_ = now;
+      stall_cxi_next_report_ = now + std::chrono::seconds(3);
+    } else if (now >= stall_cxi_next_report_) {
+      stall_cxi_next_report_ = now + std::chrono::seconds(5);
+      auto const stalled_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - stall_cxi_since_)
+              .count();
+      std::fprintf(stderr,
+                   "[proxy-cxi-stall rank=%d thread=%d stalled_ms=%lld] "
+                   "outstanding=%zu pending_ops=%zu free_atomic_slots=%zu "
+                   "acked_wrs=%zu inflight_bytes=%zu quiet_inflight=%d "
+                   "barrier_inflight=%d]\n",
+                   cfg_.rank, cfg_.thread_idx,
+                   static_cast<long long>(stalled_ms), cxi_outstanding_ops_,
+                   pending, cxi_free_atomic_operand_slots_total(),
+                   acked_wrs_.size(),
+                   current_inflight_bytes.load(std::memory_order_acquire),
+                   static_cast<int>(ctx_.quiet_inflight),
+                   static_cast<int>(ctx_.barrier_inflight));
+      if (ctx_.barrier_inflight) dump_barrier_state("proxy-cxi-stall");
+    }
+  } else {
+    stall_cxi_seen_outstanding_ = 0;
+    stall_cxi_seen_pending_ = 0;
+  }
+
+  if (!ctx_.barrier_inflight) {
+    stall_barrier_seen_seq_ = ~0ull;
+    return;
+  }
+
+  if (stall_barrier_seen_seq_ != ctx_.barrier_seq) {
+    stall_barrier_seen_seq_ = ctx_.barrier_seq;
+    stall_barrier_since_ = now;
+    stall_barrier_next_report_ = now + std::chrono::seconds(3);
+    return;
+  }
+  if (now < stall_barrier_next_report_) return;
+
+  stall_barrier_next_report_ = now + std::chrono::seconds(5);
+  auto const barrier_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now - stall_barrier_since_)
+                              .count();
+  std::fprintf(stderr,
+               "[proxy-barrier-stall rank=%d thread=%d stalled_ms=%lld]\n",
+               cfg_.rank, cfg_.thread_idx, static_cast<long long>(barrier_ms));
+  dump_barrier_state("proxy-barrier-stall");
 }
 
 void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
@@ -1274,13 +1461,18 @@ void Proxy::post_cxi_commands(std::vector<uint64_t> const& wrs_to_post,
         ++cxi_outstanding_ops_;
         break;
       }
-      case CmdType::QUIET:
+      case CmdType::QUIET: {
+        StallReporter stall("cxi_quiet_drain", cfg_.rank, cfg_.thread_idx);
         while (cxi_outstanding_ops_ > 0) {
           poll_cxi_completions();
+          stall.tick("outstanding=%zu pending_ops=%zu free_atomic_slots=%zu",
+                     cxi_outstanding_ops_, cxi_pending_ops_total(),
+                     cxi_free_atomic_operand_slots_total());
           if (cxi_outstanding_ops_ > 0) cpu_relax();
         }
         acked_wrs_.insert(wrs_to_post[i]);
         break;
+      }
       case CmdType::BARRIER:
         send_barrier(wrs_to_post[i]);
         break;

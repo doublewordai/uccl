@@ -32,6 +32,8 @@ void CxiTransport::post_barrier_atomic_add(int, uint64_t, size_t, uint64_t) {
   unavailable();
 }
 uint64_t CxiTransport::load_barrier_word(size_t) const { unavailable(); }
+size_t CxiTransport::pending_ops() const { return 0; }
+size_t CxiTransport::free_atomic_operand_slots() const { return 0; }
 int CxiTransport::poll(TransportCompletion*, int) { unavailable(); }
 void CxiTransport::destroy() {}
 
@@ -399,6 +401,16 @@ uint64_t CxiTransport::load_barrier_word(size_t slot) const {
     throw std::runtime_error("CXI barrier slot out of range");
   }
   return __atomic_load_n(&barrier_words_[slot], __ATOMIC_ACQUIRE);
+}
+
+size_t CxiTransport::pending_ops() const { return op_contexts_.size(); }
+
+size_t CxiTransport::free_atomic_operand_slots() const {
+  size_t free = 0;
+  for (auto used : atomic_operand_used_) {
+    if (!used) ++free;
+  }
+  return free;
 }
 
 int CxiTransport::poll(TransportCompletion* out, int max) {

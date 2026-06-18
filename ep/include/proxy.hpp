@@ -122,6 +122,10 @@ class Proxy {
   void barrier_check();
   void quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds);
   void quiet_cq();
+  void stall_scan();
+  void dump_barrier_state(char const* site) const;
+  size_t cxi_pending_ops_total() const;
+  size_t cxi_free_atomic_operand_slots_total() const;
   RDMAConnectionInfo local_info_{}, remote_info_{};
 
   // Reuse across multiple calls to avoid reallocations
@@ -164,6 +168,18 @@ class Proxy {
   std::vector<uint64_t> ring_tails_;
   std::vector<size_t> ring_seen_;
 #endif
+
+  uint64_t stall_scan_iter_ = 0;
+  std::vector<uint64_t> stall_front_wr_;
+  std::vector<std::chrono::steady_clock::time_point> stall_front_since_;
+  std::vector<std::chrono::steady_clock::time_point> stall_next_report_;
+  size_t stall_cxi_seen_outstanding_ = 0;
+  size_t stall_cxi_seen_pending_ = 0;
+  std::chrono::steady_clock::time_point stall_cxi_since_;
+  std::chrono::steady_clock::time_point stall_cxi_next_report_;
+  uint64_t stall_barrier_seen_seq_ = ~0ull;
+  std::chrono::steady_clock::time_point stall_barrier_since_;
+  std::chrono::steady_clock::time_point stall_barrier_next_report_;
 };
 
 #endif  // PROXY_HPP
