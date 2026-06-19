@@ -391,8 +391,8 @@ __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(
   uint64_t slots[kNumProxyThs];
   int num_posted = 0;
 
-  // First, post one BARRIER command. QUIET handles per-ring write fencing;
-  // the barrier is only a rank-level rendezvous.
+  // First, post one BARRIER command per proxy thread. QUIET handles per-ring
+  // write fencing; the barrier drains each proxy thread's rendezvous.
   for (int d2h_channel_idx = 0; d2h_channel_idx < num_d2h_channel_addrs;
        d2h_channel_idx += kChannelPerProxy) {
     auto* h = reinterpret_cast<d2hq::D2HHandle*>(
@@ -420,10 +420,9 @@ __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(
       }
     }
 #endif
-    break;
   }
 
-  // Then wait for the posted barrier to complete
+  // Then wait for each proxy thread's barrier to complete.
   for (int i = 0; i < num_posted; ++i) {
     auto* h = reinterpret_cast<d2hq::D2HHandle*>(
         static_cast<uintptr_t>(d2h_channel_addrs[i * kChannelPerProxy]));
