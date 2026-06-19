@@ -856,18 +856,15 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
                                          std::memory_order_release);
       }
 
-      uint32_t const front_seq = static_cast<uint32_t>(front_wr);
-      if (ctx_.quiet_wr != -1 &&
-          front_seq == static_cast<uint32_t>(ctx_.quiet_wr)) {
+      if (ctx_.quiet_wr != kInvalidWrId && front_wr == ctx_.quiet_wr) {
         ctx_.quiet_inflight = false;
-        ctx_.quiet_wr = -1;
+        ctx_.quiet_wr = kInvalidWrId;
         fifo->pop();
       }
 
-      if (ctx_.barrier_wr != -1 &&
-          front_seq == static_cast<uint32_t>(ctx_.barrier_wr)) {
+      if (ctx_.barrier_wr != kInvalidWrId && front_wr == ctx_.barrier_wr) {
         ctx_.barrier_inflight = false;
-        ctx_.barrier_wr = -1;
+        ctx_.barrier_wr = kInvalidWrId;
         fifo->pop();
       }
     }
@@ -955,12 +952,12 @@ void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
           get_base_cmd(cmd.cmd_type) == CmdType::QUIET) {
         if (get_base_cmd(cmd.cmd_type) == CmdType::BARRIER) {
           assert(!ctx_.barrier_inflight);
-          assert(ctx_.barrier_wr == -1);
+          assert(ctx_.barrier_wr == kInvalidWrId);
           ctx_.barrier_inflight = true;
           if (use_cxi_transport()) ctx_.barrier_wr = unique_wr_id;
         } else if (get_base_cmd(cmd.cmd_type) == CmdType::QUIET) {
           assert(!ctx_.quiet_inflight);
-          assert(ctx_.quiet_wr == -1);
+          assert(ctx_.quiet_wr == kInvalidWrId);
           ctx_.quiet_inflight = true;
           if (use_cxi_transport()) ctx_.quiet_wr = unique_wr_id;
         }
@@ -1421,7 +1418,7 @@ void Proxy::post_gpu_commands_mixed(
 
   if (!barrier_cmds.empty()) {
 #ifdef USE_MSCCLPP_FIFO_BACKEND
-    assert(barrier_wrs.size() == 1 && ctx_.barrier_wr == -1);
+    assert(barrier_wrs.size() == 1 && ctx_.barrier_wr == kInvalidWrId);
 #endif
     assert(quiet_wrs.empty() && "quiet_wrs should be empty");
     send_barrier(barrier_wrs[0]);
@@ -1431,7 +1428,7 @@ void Proxy::post_gpu_commands_mixed(
 
   if (!quiet_cmds.empty()) {
 #ifdef USE_MSCCLPP_FIFO_BACKEND
-    assert(quiet_wrs.size() == 1 && ctx_.quiet_wr == -1);
+    assert(quiet_wrs.size() == 1 && ctx_.quiet_wr == kInvalidWrId);
 #endif
     ctx_.quiet_wr = quiet_wrs[0];
     quiet(quiet_wrs, quiet_cmds);
@@ -1785,11 +1782,10 @@ void Proxy::send_barrier(uint64_t wr) {
   assert(!ctx_.barrier_inflight && "only one barrier at a time");
   ctx_.barrier_inflight = true;
 #endif
-  if (ctx_.barrier_wr == -1) {
+  if (ctx_.barrier_wr == kInvalidWrId) {
     ctx_.barrier_wr = wr;
   } else {
-    assert(use_cxi_transport() && static_cast<uint32_t>(ctx_.barrier_wr) ==
-                                      static_cast<uint32_t>(wr));
+    assert(use_cxi_transport() && ctx_.barrier_wr == wr);
   }
   ctx_.barrier_seq = (ctx_.barrier_seq + 1) & BarrierImm::kSeqMask;
 
@@ -1862,7 +1858,7 @@ void Proxy::barrier_check() {
       acked_wrs_.insert(ctx_.barrier_wr);
 #ifndef USE_MSCCLPP_FIFO_BACKEND
       ctx_.barrier_inflight = false;
-      ctx_.barrier_wr = -1;
+      ctx_.barrier_wr = kInvalidWrId;
 #endif
       return;
     }
@@ -1878,7 +1874,7 @@ void Proxy::barrier_check() {
     acked_wrs_.insert(ctx_.barrier_wr);
 #ifndef USE_MSCCLPP_FIFO_BACKEND
     ctx_.barrier_inflight = false;
-    ctx_.barrier_wr = -1;
+    ctx_.barrier_wr = kInvalidWrId;
 #endif
   }
 }
@@ -1943,7 +1939,7 @@ void Proxy::barrier_check() {
         acked_wrs_.insert(ctx_.barrier_wr);
 #ifndef USE_MSCCLPP_FIFO_BACKEND
         ctx_.barrier_inflight = false;
-        ctx_.barrier_wr = -1;
+        ctx_.barrier_wr = kInvalidWrId;
 #endif
         return;
       }
@@ -1955,7 +1951,7 @@ void Proxy::barrier_check() {
       acked_wrs_.insert(ctx_.barrier_wr);
 #ifndef USE_MSCCLPP_FIFO_BACKEND
       ctx_.barrier_inflight = false;
-      ctx_.barrier_wr = -1;
+      ctx_.barrier_wr = kInvalidWrId;
 #endif
       return;
     }
@@ -1965,7 +1961,7 @@ void Proxy::barrier_check() {
       acked_wrs_.insert(ctx_.barrier_wr);
 #ifndef USE_MSCCLPP_FIFO_BACKEND
       ctx_.barrier_inflight = false;
-      ctx_.barrier_wr = -1;
+      ctx_.barrier_wr = kInvalidWrId;
 #endif
     }
     return;
@@ -2030,7 +2026,7 @@ void Proxy::barrier_check() {
           acked_wrs_.insert(ctx_.barrier_wr);
 #ifndef USE_MSCCLPP_FIFO_BACKEND
           ctx_.barrier_inflight = false;
-          ctx_.barrier_wr = -1;
+          ctx_.barrier_wr = kInvalidWrId;
 #endif
           return;
         }
@@ -2049,7 +2045,7 @@ void Proxy::barrier_check() {
         acked_wrs_.insert(ctx_.barrier_wr);
 #ifndef USE_MSCCLPP_FIFO_BACKEND
         ctx_.barrier_inflight = false;
-        ctx_.barrier_wr = -1;
+        ctx_.barrier_wr = kInvalidWrId;
 #endif
       }
     }
@@ -2064,7 +2060,7 @@ void Proxy::barrier_check() {
     acked_wrs_.insert(ctx_.barrier_wr);
 #ifndef USE_MSCCLPP_FIFO_BACKEND
     ctx_.barrier_inflight = false;
-    ctx_.barrier_wr = -1;
+    ctx_.barrier_wr = kInvalidWrId;
 #endif
   }
 }

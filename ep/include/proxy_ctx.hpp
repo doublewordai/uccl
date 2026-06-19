@@ -3,9 +3,13 @@
 #include "util/gpu_rt.h"
 #include <infiniband/verbs.h>
 #include <atomic>
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <unordered_map>
 #include <vector>
+
+static constexpr uint64_t kInvalidWrId = std::numeric_limits<uint64_t>::max();
 
 template <typename Key>
 class TokenCounter {
@@ -201,10 +205,10 @@ struct ProxyCtx {
   // Async-barrier state (single inflight assumed)
   bool barrier_inflight = false;
   uint64_t barrier_seq = 0;
-  int barrier_wr = -1;
+  uint64_t barrier_wr = kInvalidWrId;
 
   bool quiet_inflight = false;
-  int quiet_wr = -1;
+  uint64_t quiet_wr = kInvalidWrId;
 
   // Rank-0 bookkeeping
   std::vector<uint8_t> barrier_arrived;  // size = num_ranks; 1 if arrival seen
