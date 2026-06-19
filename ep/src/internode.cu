@@ -3046,7 +3046,9 @@ void combine(cudaDataType_t type, void* combined_x,
 #define COMBINE_LAUNCH_CASE(num_rdma_ranks)                                 \
   {                                                                         \
     constexpr int kNumCaseCombineForwarderWarps =                            \
-        num_rdma_ranks == 3 ? 12 : kNumCombineForwarderWarps;                \
+        num_rdma_ranks >= 4 ? 8                                              \
+                            : (num_rdma_ranks == 3 ? 12                     \
+                                                   : kNumCombineForwarderWarps); \
     constexpr int smem_size =                                                \
         std::max(kNumTMABytesPerSenderWarp * NUM_MAX_NVL_PEERS,              \
                  kNumTMABytesPerForwarderWarp *                              \
@@ -3080,10 +3082,12 @@ void combine(cudaDataType_t type, void* combined_x,
   break
 
   int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-  // EP12 has 3 RDMA ranks; the 16-warp specialization asks for too much
-  // dynamic shared memory on GH200 during combine kernel setup.
+  // EP12/EP16 need smaller combine specializations on GH200; otherwise the
+  // generated kernel asks for too much dynamic shared memory during setup.
   int combine_forwarder_warps =
-      num_rdma_ranks == 3 ? 12 : kNumCombineForwarderWarps;
+      num_rdma_ranks >= 4
+          ? 8
+          : (num_rdma_ranks == 3 ? 12 : kNumCombineForwarderWarps);
   auto num_warps_per_forwarder =
       std::max(combine_forwarder_warps / num_rdma_ranks, 1);
   int num_forwarder_warps = num_rdma_ranks * num_warps_per_forwarder;
