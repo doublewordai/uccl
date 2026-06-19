@@ -72,27 +72,99 @@ static std::string shm_name_for_barrier(std::string const& ip,
          (use_normal_mode ? "_ht" : "_ll") + "_th" + std::to_string(thread_idx);
 }
 
+static char const* local_barrier_dir() {
+  char const* dir = std::getenv("UCCL_LOCAL_BARRIER_DIR");
+  return (dir && dir[0] != '\0') ? dir : nullptr;
+}
+
+static bool mkdir_p(std::string const& path) {
+  if (path.empty()) return false;
+
+  std::string cur;
+  size_t pos = 0;
+  if (path[0] == '/') {
+    cur = "/";
+    pos = 1;
+  }
+
+  while (pos <= path.size()) {
+    size_t const next = path.find('/', pos);
+    std::string const component =
+        path.substr(pos, next == std::string::npos ? std::string::npos
+                                                   : next - pos);
+    if (!component.empty()) {
+      if (cur.empty() || cur.back() != '/') cur += "/";
+      cur += component;
+      if (mkdir(cur.c_str(), 0700) != 0 && errno != EEXIST) {
+        perror("mkdir(UCCL_LOCAL_BARRIER_DIR)");
+        return false;
+      }
+    }
+    if (next == std::string::npos) break;
+    pos = next + 1;
+  }
+
+  return true;
+}
+
+static std::string barrier_file_path(std::string const& name) {
+  std::string filename;
+  filename.reserve(name.size());
+  for (char c : name) {
+    bool const keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                      c == '-';
+    filename.push_back(keep ? c : '_');
+  }
+  return std::string(local_barrier_dir()) + "/" + filename;
+}
+
+static int open_local_barrier_object(std::string const& name) {
+  mode_t const kMode = 0600;
+  char const* dir = local_barrier_dir();
+  if (!dir) return shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, kMode);
+
+  if (!mkdir_p(dir)) return -1;
+  return open(barrier_file_path(name).c_str(), O_RDWR | O_CREAT | O_EXCL,
+              kMode);
+}
+
+static int open_existing_local_barrier_object(std::string const& name) {
+  mode_t const kMode = 0600;
+  if (!local_barrier_dir()) return shm_open(name.c_str(), O_RDWR, kMode);
+  return open(barrier_file_path(name).c_str(), O_RDWR, kMode);
+}
+
+static void unlink_local_barrier_object(std::string const& name) {
+  if (local_barrier_dir()) {
+    unlink(barrier_file_path(name).c_str());
+  } else {
+    shm_unlink(name.c_str());
+  }
+}
+
 LocalBarrier* map_local_barrier_shm(std::string const& name, bool* out_owner) {
   *out_owner = false;
   size_t const kSize = sizeof(LocalBarrier);
-  mode_t const kMode = 0600;
-  int fd = shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, kMode);
+  int fd = open_local_barrier_object(name);
   if (fd >= 0) {
     *out_owner = true;
     if (ftruncate(fd, kSize) != 0) {
       perror("ftruncate(LocalBarrier)");
       close(fd);
-      shm_unlink(name.c_str());
+      unlink_local_barrier_object(name);
       return nullptr;
     }
   } else {
     if (errno != EEXIST) {
-      perror("shm_open");
+      perror(local_barrier_dir() ? "open(UCCL_LOCAL_BARRIER_DIR)"
+                                 : "shm_open");
       return nullptr;
     }
-    fd = shm_open(name.c_str(), O_RDWR, kMode);
+    fd = open_existing_local_barrier_object(name);
     if (fd < 0) {
-      perror("shm_open(existing)");
+      perror(local_barrier_dir() ? "open(existing UCCL_LOCAL_BARRIER_DIR)"
+                                 : "shm_open(existing)");
       return nullptr;
     }
     struct stat st {};
@@ -104,8 +176,11 @@ LocalBarrier* map_local_barrier_shm(std::string const& name, bool* out_owner) {
     }
     if (tries < 0) {
       fprintf(stderr,
-              "map_local_barrier_shm: existing shm '%s' never sized to %zu\n",
-              name.c_str(), kSize);
+              "map_local_barrier_shm: existing barrier '%s' never sized to "
+              "%zu\n",
+              local_barrier_dir() ? barrier_file_path(name).c_str()
+                                  : name.c_str(),
+              kSize);
       close(fd);
       return nullptr;
     }
@@ -124,7 +199,7 @@ LocalBarrier* map_local_barrier_shm(std::string const& name, bool* out_owner) {
 void unmap_local_barrier_shm(std::string const& name, LocalBarrier* lb,
                              bool owner) {
   if (lb) munmap(lb, sizeof(LocalBarrier));
-  if (owner) shm_unlink(name.c_str());
+  if (owner) unlink_local_barrier_object(name);
 }
 #endif
 
