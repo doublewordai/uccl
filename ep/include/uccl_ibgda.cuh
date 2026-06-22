@@ -252,6 +252,7 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
       }
     }
 #endif
+    break;
   }
 }
 
