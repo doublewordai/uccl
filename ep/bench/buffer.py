@@ -778,10 +778,17 @@ class Buffer:
         """
 
         # TODO: automatically tune
+        # num_max_rdma_chunked_send_tokens (4th field) must be >=
+        # kNumCombineForwarderWarps / num_rdma_ranks, else the combine kernel
+        # asserts. For these small-rank configs that bound is only binding when
+        # the rank count spans RDMA, i.e. on nodes with < 8 GPUs per node
+        # (e.g. 4-GPU GH200 / NUM_MAX_NVL_PEERS=4). On 8-GPU nodes these rank
+        # counts are intra-node so the value is immaterial; raise it to 16 so the
+        # bound holds on small-NVL topologies without affecting NVL8.
         config_map = {
-            2: Config(Buffer.num_sms, 10, 256, 6, 128),
-            4: Config(Buffer.num_sms, 9, 256, 6, 128),
-            8: Config(Buffer.num_sms, 4, 256, 6, 128),
+            2: Config(Buffer.num_sms, 10, 256, 16, 128),
+            4: Config(Buffer.num_sms, 9, 256, 16, 128),
+            8: Config(Buffer.num_sms, 4, 256, 16, 128),
             16: Config(Buffer.num_sms, 4, 288, 12, 512 if Buffer._is_efa() else 128),
             24: Config(Buffer.num_sms, 1, 288, 8, 128),
             32: Config(Buffer.num_sms, 1, 288, 8, 512 if Buffer._is_efa() else 128),
