@@ -12,7 +12,7 @@ template <int kNumRanks>
 __global__ void notify_dispatch(
     int const* num_tokens_per_rank, int* moe_recv_counter_mapped,
     int const* num_tokens_per_expert, int* moe_recv_expert_counter_mapped,
-    int num_experts, int num_tokens, int num_channels,
+    int num_experts, int num_tokens, int num_worst_tokens, int num_channels,
     bool const* is_token_in_rank, int* channel_prefix_matrix,
     int* rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
     void** buffer_ptrs, int** barrier_signal_ptrs, int rank) {
@@ -59,7 +59,11 @@ __global__ void notify_dispatch(
       for (int i = 1; i < kNumRanks; ++i)
         local_per_rank_buffer[i * kNumRanks + thread_id] +=
             local_per_rank_buffer[(i - 1) * kNumRanks + thread_id];
-      if (thread_id == rank)
+      // Graph-mode (num_worst_tokens>0) must not write the host-mapped
+      // counter: replays run with no host poll, so a sum written mid-flight
+      // by a lagging replay clobbers the -1 reset of a host-synced eager
+      // dispatch on the same Buffer, which then reads a stale count.
+      if (thread_id == rank && num_worst_tokens == 0)
         *moe_recv_counter_mapped =
             local_per_rank_buffer[(kNumRanks - 1) * kNumRanks + rank];
     }
@@ -73,7 +77,8 @@ __global__ void notify_dispatch(
       for (int i = 0; i < kNumRanks; ++i)
         sum += local_per_expert_buffer[i * num_experts_per_rank + thread_id];
       sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
-      moe_recv_expert_counter_mapped[thread_id] = sum;
+      if (num_worst_tokens == 0)
+        moe_recv_expert_counter_mapped[thread_id] = sum;
     }
     __syncthreads();
 
@@ -122,7 +127,8 @@ void notify_dispatch(int const* num_tokens_per_rank,
                      int* moe_recv_counter_mapped, int num_ranks,
                      int const* num_tokens_per_expert,
                      int* moe_recv_expert_counter_mapped, int num_experts,
-                     int num_tokens, bool const* is_token_in_rank,
+                     int num_tokens, int num_worst_tokens,
+                     bool const* is_token_in_rank,
                      int* channel_prefix_matrix, int* rank_prefix_matrix_copy,
                      int num_memset_int, int expert_alignment,
                      void** buffer_ptrs, int** barrier_signal_ptrs, int rank,
@@ -131,6 +137,7 @@ void notify_dispatch(int const* num_tokens_per_rank,
   LAUNCH_KERNEL(&cfg, notify_dispatch<ranks>, num_tokens_per_rank,         \
                 moe_recv_counter_mapped, num_tokens_per_expert,            \
                 moe_recv_expert_counter_mapped, num_experts, num_tokens,   \
+                num_worst_tokens,                                          \
                 num_channels, is_token_in_rank, channel_prefix_matrix,     \
                 rank_prefix_matrix_copy, num_memset_int, expert_alignment, \
                 buffer_ptrs, barrier_signal_ptrs, rank);                   \
