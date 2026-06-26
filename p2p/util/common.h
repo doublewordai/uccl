@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <future>
@@ -55,7 +56,35 @@ typedef struct AcceptedMeta {
 
 // Notifications
 static constexpr uint32_t NOTIFY_MSG_MAGIC = 0xDEADDEAD;
-static constexpr size_t NOTIFY_MSG_SIZE = 256;
+// Notification buffer capacity in bytes, shared by notify_msg_t (uccl_engine.h)
+// and NotifyMsg below. The vLLM NixlConnector's KV-transfer completion
+// notification can serialize to several KiB at high request concurrency; at the
+// previous hardcoded 256 it overflowed the buffer and was dropped, so the
+// producer never learned the consumer had read the KV blocks and stalled until
+// the lease expired. These structs are fixed-size (the NIXL backend stack-
+// allocates notify_msg_t), so capacity is necessarily a compile-time constant;
+// the default is raised and can be overridden at build time with
+// -DUCCL_NOTIFY_MSG_SIZE=N.
+#ifndef UCCL_NOTIFY_MSG_SIZE
+#define UCCL_NOTIFY_MSG_SIZE 16384
+#endif
+static constexpr size_t NOTIFY_MSG_SIZE = UCCL_NOTIFY_MSG_SIZE;
+
+// Effective notification-size limit, tunable at runtime via the
+// UCCL_P2P_NOTIFY_MSG_SIZE env var (clamped to the compile-time capacity above;
+// defaults to the full capacity). Consumers that build notifications should
+// reject a message larger than this with a clear error instead of dropping it.
+inline size_t uccl_notify_msg_limit() {
+  static size_t const lim = []() -> size_t {
+    if (char const* e = std::getenv("UCCL_P2P_NOTIFY_MSG_SIZE")) {
+      char* end = nullptr;
+      unsigned long v = std::strtoul(e, &end, 10);
+      if (end != e && v > 0) return std::min<size_t>(v, NOTIFY_MSG_SIZE);
+    }
+    return NOTIFY_MSG_SIZE;
+  }();
+  return lim;
+}
 // Returned when no operation was posted, but retrying may succeed. CXI uses
 // this explicit sentinel; non-CXI paths keep the older -1 retry behavior in
 // engine.cc.
