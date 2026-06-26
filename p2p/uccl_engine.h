@@ -5,7 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MSG_SIZE 256
+// Notification buffer capacity; shared with NotifyMsg in common.h (included
+// above). See UCCL_NOTIFY_MSG_SIZE there for the rationale and how to override.
+#define MSG_SIZE UCCL_NOTIFY_MSG_SIZE
 #define FIFO_SIZE 64
 #define IPC_INFO_SIZE 128
 // Handle for the UCCL engine instance
