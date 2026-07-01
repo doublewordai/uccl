@@ -525,6 +525,35 @@ std::tuple<std::string, uint16_t, std::string> Endpoint::parse_metadata(
   return std::make_tuple(ip_str, port, gpu_bdf);
 }
 
+int Endpoint::resolve_gpu_bdf_to_index(std::string const& gpu_bdf) {
+  if (gpu_bdf.empty()) return 0;
+
+  std::string const wanted_bdf = uccl::normalize_pci_bus_id(gpu_bdf);
+  int device_count = 0;
+  if (gpuGetDeviceCount(&device_count) != gpuSuccess) {
+    std::cerr << "UCCL P2P: failed to query CUDA device count while resolving "
+              << wanted_bdf << "; defaulting remote GPU index to 0"
+              << std::endl;
+    return 0;
+  }
+
+  for (int i = 0; i < device_count; ++i) {
+    char bdf_buf[64];
+    if (gpuDeviceGetPCIBusId(bdf_buf, sizeof(bdf_buf), i) != gpuSuccess) {
+      continue;
+    }
+    if (uccl::normalize_pci_bus_id(bdf_buf) == wanted_bdf) {
+      return i;
+    }
+  }
+
+  std::cerr << "UCCL P2P: remote GPU BDF " << wanted_bdf
+            << " did not match any local CUDA device; defaulting remote GPU "
+               "index to 0"
+            << std::endl;
+  return 0;
+}
+
 bool Endpoint::accept(std::string& ip_addr, int& remote_gpu_idx,
                       uint64_t& conn_id) {
   std::cout << "Waiting to accept incoming connection..." << std::endl;
@@ -2023,7 +2052,8 @@ bool Endpoint::add_remote_endpoint(std::vector<uint8_t> const& metadata,
   if (is_local && !remote_gpu_bdf.empty()) {
     success = connect_local(remote_gpu_bdf, conn_id);
   } else {
-    success = connect(remote_ip, 0, remote_port, conn_id);
+    int remote_gpu_idx = resolve_gpu_bdf_to_index(remote_gpu_bdf);
+    success = connect(remote_ip, remote_gpu_idx, remote_port, conn_id);
   }
   if (success) {
     std::unique_lock<std::shared_mutex> lock(conn_mu_);
