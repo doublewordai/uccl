@@ -2277,13 +2277,6 @@ void Endpoint::initialize_engine() {
 
 void Endpoint::send_proxy_thread_func() {
   uccl::pin_thread_to_numa(numa_node_);
-  // Bind this worker thread to the engine's GPU. It issues fi_read/fi_write (and
-  // IPC) against GPU memory, and libfabric's HMEM path resolves device pointers
-  // via the CUDA driver (e.g. cuMemGetAddressRange), which requires a *current*
-  // CUDA context on the calling thread. Without this, HMEM mapping fails with
-  // CUDA_ERROR_INVALID_CONTEXT and transfers error out (observed: the 2nd and
-  // later consecutive fi_reads returned EIO, stalling KV-cache transfer).
-  if (local_gpu_idx_ != INVALID_GPU) GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
   // Use 16-byte buffer to avoid stringop-overflow warning from jring's 16-byte
   // bulk copy
   alignas(16) char task_buffer[16];
@@ -2322,13 +2315,6 @@ void Endpoint::send_proxy_thread_func() {
 
 void Endpoint::recv_proxy_thread_func() {
   uccl::pin_thread_to_numa(numa_node_);
-  // Bind this worker thread to the engine's GPU. It issues fi_read/fi_write (and
-  // IPC) against GPU memory, and libfabric's HMEM path resolves device pointers
-  // via the CUDA driver (e.g. cuMemGetAddressRange), which requires a *current*
-  // CUDA context on the calling thread. Without this, HMEM mapping fails with
-  // CUDA_ERROR_INVALID_CONTEXT and transfers error out (observed: the 2nd and
-  // later consecutive fi_reads returned EIO, stalling KV-cache transfer).
-  if (local_gpu_idx_ != INVALID_GPU) GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
   // Use 16-byte buffer to avoid stringop-overflow warning from jring's 16-byte
   // bulk copy
   alignas(16) char task_buffer[16];
