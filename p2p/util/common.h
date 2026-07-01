@@ -58,14 +58,15 @@ typedef struct AcceptedMeta {
 static constexpr uint32_t NOTIFY_MSG_MAGIC = 0xDEADDEAD;
 // Notification buffer capacity in bytes, shared by notify_msg_t (uccl_engine.h)
 // and NotifyMsg below. The vLLM NixlConnector's KV-transfer completion
-// notification serializes to ~305 B; at the previous hardcoded 256 it overflowed
-// the buffer and was dropped, so the producer never learned the consumer had read
-// the KV blocks and stalled until the lease expired. These structs are fixed-size
-// (the NIXL backend stack-allocates notify_msg_t), so capacity is necessarily a
-// compile-time constant; the default is raised and can be overridden at build time
-// with -DUCCL_NOTIFY_MSG_SIZE=N.
+// notification can serialize to several KiB at high request concurrency; at the
+// previous hardcoded 256 it overflowed the buffer and was dropped, so the
+// producer never learned the consumer had read the KV blocks and stalled until
+// the lease expired. These structs are fixed-size (the NIXL backend stack-
+// allocates notify_msg_t), so capacity is necessarily a compile-time constant;
+// the default is raised and can be overridden at build time with
+// -DUCCL_NOTIFY_MSG_SIZE=N.
 #ifndef UCCL_NOTIFY_MSG_SIZE
-#define UCCL_NOTIFY_MSG_SIZE 1024
+#define UCCL_NOTIFY_MSG_SIZE 16384
 #endif
 static constexpr size_t NOTIFY_MSG_SIZE = UCCL_NOTIFY_MSG_SIZE;
 
