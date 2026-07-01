@@ -288,10 +288,14 @@ class Endpoint {
 
   std::vector<uint8_t> get_metadata();
 
-  /* Parse endpoint metadata to extract IP address, port, and GPU index.
-   * Returns a tuple of (ip_address, port, gpu_index). */
+  /* Parse endpoint metadata to extract IP address, port, and GPU BDF.
+   * Returns a tuple of (ip_address, port, gpu_bdf). */
   static std::tuple<std::string, uint16_t, std::string> parse_metadata(
       std::vector<uint8_t> const& metadata);
+
+  /* Resolve an advertised GPU BDF to a local CUDA device index. Homogeneous
+   * nodes use matching BDF layouts; fall back to GPU 0 when unavailable. */
+  static int resolve_gpu_bdf_to_index(std::string const& gpu_bdf);
 
   /* Accept an incoming connection via TCP, then build RDMA QP connections. */
   bool accept(std::string& ip_addr, int& remote_gpu_idx, uint64_t& conn_id);
