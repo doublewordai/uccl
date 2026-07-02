@@ -136,7 +136,7 @@ $(P2P_PYTHON_EXT): $(OBJECTS) $(NB_OBJECTS) $(DL_OBJECTS)
 $(P2P_SHARED_LIB): $(CAPI_OBJECT) $(CORE_OBJECT)
 	$(CXX) $(CAPI_OBJECT) $(CORE_OBJECT) \
 	      -L$(CUDA_LIB) -lcudart -lcuda \
-	      -o $@ $(LDFLAGS) $(PYTHON_LDFLAGS) $(CXXFLAGS) \
+	      -o $@ $(LDFLAGS) $(CXI_LDFLAGS) $(PYTHON_LDFLAGS) $(CXXFLAGS) \
 	      -Wl,-rpath,$(CUDA_LIB) $(PYTHON_LIB) $(INC) $(LIBS)
 
 # Compile nanobind source files for stable ABI
