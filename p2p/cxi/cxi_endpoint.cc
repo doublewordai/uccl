@@ -647,9 +647,6 @@ int CxiEndpoint::post_rma(bool is_read, ConnID const& conn,
     // FI_EAGAIN means the provider is momentarily out of posting resources;
     // drive the CQ, yield, and let the caller retry. Any other non-zero rc
     // (notably FI_EIO) is a hard failure: fall through and fail closed.
-    // Previously FI_EIO was also treated as transient, so the caller retried
-    // it forever -- an infinite livelock that stalled KV transfers with no
-    // completion and no error ever surfacing to NIXL.
     if (rc == -FI_EAGAIN) {
       poll_cq_locked();
       std::this_thread::yield();
