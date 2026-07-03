@@ -209,9 +209,8 @@ uccl_conn_t* uccl_engine_connect(uccl_engine_t* engine, char const* ip_addr,
     }
   } else {
     // Remote inter-node: use RDMA/NCCL network connection.
-    int remote_gpu_idx = Endpoint::resolve_gpu_bdf_to_index(remote_bdf);
-    ok = engine->endpoint->connect(std::string(ip_addr), remote_gpu_idx,
-                                   remote_port, conn_id);
+    ok = engine->endpoint->connect(std::string(ip_addr), 0, remote_port,
+                                   conn_id);
     if (ok) {
       conn->sock_fd = engine->endpoint->get_sock_fd(conn_id);
       if (!is_nccl_transport()) {
