@@ -71,7 +71,10 @@ class CxiEndpoint {
                        void* src, size_t size, FifoItem const& fifo_item,
                        UcclRequest* ureq);
 
-  bool check_send_complete_once(uint64_t peer_id, int64_t request_id);
+  // Returns true once the request has completed (successfully or not) and
+  // has been retired. A completion carrying a CQ error sets *failed.
+  bool check_send_complete_once(uint64_t peer_id, int64_t request_id,
+                                bool* failed);
   void send_routine();
   void recv_routine();
   void flush_all_sends() {}

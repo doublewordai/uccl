@@ -747,8 +747,7 @@ void CxiEndpoint::poll_cq_locked() {
 }
 
 bool CxiEndpoint::check_send_complete_once(uint64_t peer_id,
-                                           int64_t request_id) {
-  (void)peer_id;
+                                           int64_t request_id, bool* failed) {
   poll_cq();
 
   std::lock_guard<std::mutex> lock(op_mutex_);
@@ -756,11 +755,14 @@ bool CxiEndpoint::check_send_complete_once(uint64_t peer_id,
   if (it == inflight_ops_.end()) return true;
   if (!it->second->done) return false;
   if (it->second->failed) {
+    // Fail closed: retire the op and report the error to the caller instead
+    // of aborting the process. The CQ error entry (err/prov_errno/message)
+    // is the decisive line for e.g. a VNI_NOT_FOUND rejection at the target.
     UCCL_LOG(ERROR) << "CXI transfer failed: request_id=" << request_id
                     << " peer_id=" << peer_id << " err=" << it->second->err
                     << " prov_errno=" << it->second->prov_errno << " "
                     << it->second->error_message;
-    std::abort();
+    if (failed) *failed = true;
   }
   inflight_ops_.erase(it);
   return true;

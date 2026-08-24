@@ -186,12 +186,15 @@ int uccl_engine_write_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
 int uccl_engine_recv(uccl_conn_t* conn, uccl_mr_t mr, void* data,
                      size_t max_size);
 /**
- * Check the status of a transfer.
+ * Poll an asynchronous transfer.
  * @param conn          Connection handle.
  * @param transfer_id   Transfer ID.
- * @return              True if the transfer is done, false otherwise.
+ * @return              1 if the transfer completed successfully, 0 if it is
+ *                      still in progress, -1 if it completed with a transport
+ *                      error. The transfer handle is released in both
+ *                      completed cases.
  */
-bool uccl_engine_xfer_status(uccl_conn_t* conn, uint64_t transfer_id);
+int uccl_engine_xfer_status(uccl_conn_t* conn, uint64_t transfer_id);
 /**
  * Cleanup connection.
  * @param conn          Connection handle to destroy.

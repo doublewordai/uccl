@@ -475,10 +475,11 @@ int uccl_engine_recv(uccl_conn_t* conn, uccl_mr_t mr, void* data,
   return -1;
 }
 
-bool uccl_engine_xfer_status(uccl_conn_t* conn, uint64_t transfer_id) {
-  bool is_done;
-  conn->engine->endpoint->poll_async(transfer_id, &is_done);
-  return is_done;
+int uccl_engine_xfer_status(uccl_conn_t* conn, uint64_t transfer_id) {
+  bool is_done = false;
+  bool ok = conn->engine->endpoint->poll_async(transfer_id, &is_done);
+  if (!is_done) return 0;
+  return ok ? 1 : -1;
 }
 
 int uccl_engine_start_listener(uccl_conn_t* conn) {
