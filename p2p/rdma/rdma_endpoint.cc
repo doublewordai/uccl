@@ -805,7 +805,9 @@ void RDMAEndpoint::check_send_complete(uint64_t peer_id, int64_t wr_id) {
       << ", wr_id: " << wr_id;
 }
 
-bool RDMAEndpoint::check_send_complete_once(uint64_t peer_id, int64_t wr_id) {
+bool RDMAEndpoint::check_send_complete_once(uint64_t peer_id, int64_t wr_id,
+                                            bool* failed) {
+  (void)failed;
   // UCCL_LOG(INFO, UCCL_RDMA) << "check_send_complete - peer_id: " << peer_id
   //           << ", wr_id: " << wr_id;
   std::shared_lock<std::shared_mutex> lock(send_channel_mutex_);

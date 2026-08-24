@@ -331,6 +331,10 @@ class UCCLLogger {
       std::abort();
     } else {
       stream_ << '\n';
+      // The sink is a plain ostream (std::cout by default) and is fully
+      // buffered when redirected to a file; flush WARN/ERROR so the line
+      // survives a crash or abort that follows it.
+      if (logLevel <= UCCLLogLevel::WARN) stream_.flush();
     }
   };
 

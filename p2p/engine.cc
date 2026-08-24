@@ -713,7 +713,7 @@ bool Endpoint::read(uint64_t conn_id, uint64_t mr_id, void* dst, size_t size,
     }
   }
 
-  return true;
+  return !ureq.failed;
 }
 
 bool Endpoint::read_async(uint64_t conn_id, uint64_t mr_id, void* dst,
@@ -819,9 +819,13 @@ bool Endpoint::readv(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
   size_t next_iov = 0;
   size_t num_completed = 0;
   size_t num_inflight = 0;
+  // Once any iov fails (post error or CQ error) stop posting, drain what is
+  // in flight so no completion can land on a retired slot, and report false.
+  bool any_failed = false;
 
-  while (num_completed < num_iovs) {
-    while (next_iov < num_iovs && num_inflight < max_inflight_ops) {
+  while (num_inflight > 0 || (next_iov < num_iovs && !any_failed)) {
+    while (!any_failed && next_iov < num_iovs &&
+           num_inflight < max_inflight_ops) {
       size_t slot = 0;
       while (slot < kMaxInflightOps && active[slot]) {
         slot++;
@@ -848,7 +852,8 @@ bool Endpoint::readv(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
       if (is_cxi_transport() && rc < 0) {
         UCCL_LOG(ERROR) << "readv failed to post iov " << next_iov
                         << ": rc=" << rc;
-        return false;
+        any_failed = true;
+        break;
       }
       active[slot] = true;
       next_iov++;
@@ -881,12 +886,13 @@ bool Endpoint::readv(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
           active[slot] = false;
           num_completed++;
           num_inflight--;
+          if (ureq[slot].failed) any_failed = true;
         }
       }
     }
   }
 
-  return true;
+  return !any_failed;
 }
 
 bool Endpoint::readv_async(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
@@ -1037,7 +1043,7 @@ bool Endpoint::write(uint64_t conn_id, uint64_t mr_id, void* src, size_t size,
     }
   }
 
-  return true;
+  return !ureq.failed;
 }
 
 bool Endpoint::write_async(uint64_t conn_id, uint64_t mr_id, void* src,
@@ -1145,9 +1151,13 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
   size_t next_iov = 0;
   size_t num_completed = 0;
   size_t num_inflight = 0;
+  // Once any iov fails (post error or CQ error) stop posting, drain what is
+  // in flight so no completion can land on a retired slot, and report false.
+  bool any_failed = false;
 
-  while (num_completed < num_iovs) {
-    while (next_iov < num_iovs && num_inflight < max_inflight_ops) {
+  while (num_inflight > 0 || (next_iov < num_iovs && !any_failed)) {
+    while (!any_failed && next_iov < num_iovs &&
+           num_inflight < max_inflight_ops) {
       size_t slot = 0;
       while (slot < kMaxInflightOps && active[slot]) {
         slot++;
@@ -1174,7 +1184,8 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
       if (is_cxi_transport() && rc < 0) {
         UCCL_LOG(ERROR) << "writev failed to post iov " << next_iov
                         << ": rc=" << rc;
-        return false;
+        any_failed = true;
+        break;
       }
       active[slot] = true;
       next_iov++;
@@ -1207,12 +1218,13 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
           active[slot] = false;
           num_completed++;
           num_inflight--;
+          if (ureq[slot].failed) any_failed = true;
         }
       }
     }
   }
 
-  return true;
+  return !any_failed;
 }
 
 bool Endpoint::writev_async(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
@@ -2102,14 +2114,19 @@ bool Endpoint::poll_async(uint64_t transfer_id, bool* is_done) {
   auto* status = reinterpret_cast<TransferStatus*>(transfer_id);
   if (status->poll_net_ureq && !status->done.load(std::memory_order_acquire)) {
     if (uccl_poll_ureq_once(ep_, &status->ureq)) {
+      if (status->ureq.failed) {
+        status->failed.store(true, std::memory_order_release);
+      }
       status->done.store(true, std::memory_order_release);
     }
   }
   *is_done = status->done.load(std::memory_order_acquire);
+  bool ok = true;
   if (*is_done) {
+    ok = !status->failed.load(std::memory_order_acquire);
     delete status;
   }
-  return true;
+  return ok;
 }
 
 int Endpoint::get_sock_fd(uint64_t conn_id) const {
@@ -2259,24 +2276,27 @@ void Endpoint::send_proxy_thread_func() {
     if (jring_sc_dequeue_bulk(send_unified_task_ring_, task_buffer, 1,
                               nullptr) == 1) {
       task = *reinterpret_cast<UnifiedTask**>(task_buffer);
+      bool ok = true;
       switch (task->type) {
         case TaskType::WRITE_NET:
-          write(task->conn_id, task->mr_id, task->data, task->size,
-                task->slot_item());
+          ok = write(task->conn_id, task->mr_id, task->data, task->size,
+                     task->slot_item());
           break;
         case TaskType::WRITEV: {
           TaskBatch const& batch = task->task_batch();
-          writev(task->conn_id, *batch.mr_id_ptr, *batch.data_ptr,
-                 *batch.size_ptr, *batch.slot_item_ptr, batch.num_iovs);
+          ok = writev(task->conn_id, *batch.mr_id_ptr, *batch.data_ptr,
+                      *batch.size_ptr, *batch.slot_item_ptr, batch.num_iovs);
           break;
         }
         default:
           UCCL_LOG(ERROR) << "Unexpected task type in send processing: "
                           << static_cast<int>(task->type);
+          ok = false;
           break;
       }
       auto* status = task->status_ptr;
       status->task_ptr.reset();
+      if (!ok) status->failed.store(true, std::memory_order_release);
       status->done.store(true, std::memory_order_release);
       send_proxy_adaptive_sleeper_.update_timer();
     }
@@ -2297,25 +2317,28 @@ void Endpoint::recv_proxy_thread_func() {
     if (jring_sc_dequeue_bulk(recv_unified_task_ring_, task_buffer, 1,
                               nullptr) == 1) {
       task = *reinterpret_cast<UnifiedTask**>(task_buffer);
+      bool ok = true;
       switch (task->type) {
         case TaskType::READ_NET:
-          read(task->conn_id, task->mr_id, task->data, task->size,
-               task->slot_item());
+          ok = read(task->conn_id, task->mr_id, task->data, task->size,
+                    task->slot_item());
           break;
         case TaskType::READV: {
           TaskBatch const& batch = task->task_batch();
-          readv(task->conn_id, *batch.mr_id_ptr, *batch.data_ptr,
-                *batch.size_ptr, *batch.slot_item_ptr, batch.num_iovs);
+          ok = readv(task->conn_id, *batch.mr_id_ptr, *batch.data_ptr,
+                     *batch.size_ptr, *batch.slot_item_ptr, batch.num_iovs);
           break;
         }
         case TaskType::WRITE_NET:
         default:
           UCCL_LOG(ERROR) << "Unexpected task type in receive processing: "
                           << static_cast<int>(task->type);
+          ok = false;
           break;
       }
       auto* status = task->status_ptr;
       status->task_ptr.reset();
+      if (!ok) status->failed.store(true, std::memory_order_release);
       status->done.store(true, std::memory_order_release);
       recv_proxy_adaptive_sleeper_.update_timer();
     } else {

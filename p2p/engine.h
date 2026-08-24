@@ -40,6 +40,9 @@ struct UcclRequest {
   enum ReqType type;
   uint32_t peer_id;
   uint32_t engine_idx;
+  // Set when the transport completed this request with an error (e.g. a CXI
+  // CQ error entry). The request still counts as complete.
+  bool failed;
 };
 
 struct Mhandle {
@@ -173,6 +176,8 @@ struct UnifiedTask;
 
 struct TransferStatus {
   std::atomic<bool> done{false};
+  // Transport reported an error for this transfer; valid once done is set.
+  std::atomic<bool> failed{false};
   std::shared_ptr<UnifiedTask> task_ptr;
   bool poll_net_ureq{false};
   UcclRequest ureq{};
@@ -390,7 +395,9 @@ class Endpoint {
   /* API for Ray */
   /***************************************************/
 
-  /* Poll the status of the asynchronous receive. */
+  /* Poll an async transfer. Sets *is_done when the transfer has completed.
+   * Returns false if it completed with a transport error (the status is
+   * released either way once done). */
   bool poll_async(uint64_t transfer_id, bool* is_done);
 
   int get_sock_fd(uint64_t conn_id) const;
