@@ -109,6 +109,22 @@ ifeq ($(PER_EXPERT_BATCHING),1)
   override NVCCFLAGS += -DPER_EXPERT_BATCHING
 endif
 
+# Lane E: dest-rank coalescing dispatch-LL path (default: disabled).
+# Independent of PER_EXPERT_BATCHING; do not set both.
+LANE_E_DESTRANK_COALESCE ?= 0
+ifeq ($(LANE_E_DESTRANK_COALESCE),1)
+  override CXXFLAGS += -DLANE_E_DESTRANK_COALESCE
+  override NVCCFLAGS += -DLANE_E_DESTRANK_COALESCE
+endif
+
+# Lane E: dest-rank coalescing combine-LL path (default: disabled).
+# Intended to be built together with LANE_E_DESTRANK_COALESCE.
+LANE_E_COMBINE_COALESCE ?= 0
+ifeq ($(LANE_E_COMBINE_COALESCE),1)
+  override CXXFLAGS += -DLANE_E_COMBINE_COALESCE
+  override NVCCFLAGS += -DLANE_E_COMBINE_COALESCE
+endif
+
 ifdef NUM_MAX_NVL_PEERS
   override CXXFLAGS += -DNUM_MAX_NVL_PEERS=$(NUM_MAX_NVL_PEERS)
   override NVCCFLAGS += -DNUM_MAX_NVL_PEERS=$(NUM_MAX_NVL_PEERS)
