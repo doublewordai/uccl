@@ -577,7 +577,9 @@ bool Endpoint::reg(void const* data, size_t size, uint64_t& mr_id,
     if (idx != -1) {
       local_gpu_idx_ = idx;
     } else {
-      local_gpu_idx_ = 0;
+      // Host memory carries no device: keep the caller's current device
+      // instead of silently moving this thread onto GPU 0.
+      GPU_RT_CHECK(gpuGetDevice(&local_gpu_idx_));
     }
     // Get PCI Bus ID for cross-process identity
     char bdf_buf[64];
@@ -622,7 +624,9 @@ bool Endpoint::regv(std::vector<void const*> const& data_v,
     if (idx != -1) {
       local_gpu_idx_ = idx;
     } else {
-      local_gpu_idx_ = 0;
+      // Host memory carries no device: keep the caller's current device
+      // instead of silently moving this thread onto GPU 0.
+      GPU_RT_CHECK(gpuGetDevice(&local_gpu_idx_));
     }
     char bdf_buf[64];
     GPU_RT_CHECK(
