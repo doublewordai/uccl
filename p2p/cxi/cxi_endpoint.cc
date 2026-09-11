@@ -532,7 +532,21 @@ int CxiEndpoint::uccl_regmr(void* data, size_t len,
     mr_attr.iface = FI_HMEM_CUDA;
     mr_attr.device.cuda = cuda_device;
 
+    // libfabric resolves the allocation with cuMemGetAddressRange, which only
+    // finds memory owned by the calling thread's current context.
+    int prev_device = -1;
+    if (cudaGetDevice(&prev_device) != cudaSuccess) {
+      UCCL_LOG(ERROR) << "cudaGetDevice failed before fi_mr_regattr(cuda)";
+      return -1;
+    }
+    if (prev_device != cuda_device &&
+        cudaSetDevice(cuda_device) != cudaSuccess) {
+      UCCL_LOG(ERROR) << "cudaSetDevice(" << cuda_device
+                      << ") failed before fi_mr_regattr(cuda)";
+      return -1;
+    }
     int ret = fi_mr_regattr(domain_, &mr_attr, 0, &out->mr);
+    if (prev_device != cuda_device) cudaSetDevice(prev_device);
     if (ret != 0) {
       UCCL_LOG(ERROR) << "fi_mr_regattr(cuda) failed: " << fi_strerror(-ret);
       return -1;
