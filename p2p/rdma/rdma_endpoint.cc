@@ -559,16 +559,15 @@ ConnID RDMAEndpoint::uccl_accept(std::string& remote_ip, int* remote_gpuidx) {
 
 void RDMAEndpoint::process_meta(std::string const& input, std::string& output,
                                 std::string const& client_ip, int client_port) {
-  if (input.size() >= sizeof(NotifyMsg)) {
-    NotifyMsg const* notify_msg =
-        reinterpret_cast<NotifyMsg const*>(input.data());
-    if (notify_msg->magic == NOTIFY_MSG_MAGIC) {
-      std::lock_guard<std::mutex> lock(notify_mutex);
-      notify_list.push_back(*notify_msg);
-      output = "";
+  {
+    NotifyMsg notify_msg;
+    if (deserialize_notify_msg(input, notify_msg)) {
       UCCL_LOG(INFO, UCCL_RDMA)
-          << "process_meta: Received notification from" << notify_msg->name
-          << " msg=" << notify_msg->msg;
+          << "process_meta: Received notification from " << notify_msg.name
+          << " (" << notify_msg.msg.size() << " bytes)";
+      std::lock_guard<std::mutex> lock(notify_mutex);
+      notify_list.push_back(std::move(notify_msg));
+      output = "";
       return;
     }
   }
@@ -805,7 +804,9 @@ void RDMAEndpoint::check_send_complete(uint64_t peer_id, int64_t wr_id) {
       << ", wr_id: " << wr_id;
 }
 
-bool RDMAEndpoint::check_send_complete_once(uint64_t peer_id, int64_t wr_id) {
+bool RDMAEndpoint::check_send_complete_once(uint64_t peer_id, int64_t wr_id,
+                                            bool* failed) {
+  (void)failed;
   // UCCL_LOG(INFO, UCCL_RDMA) << "check_send_complete - peer_id: " << peer_id
   //           << ", wr_id: " << wr_id;
   std::shared_lock<std::shared_mutex> lock(send_channel_mutex_);

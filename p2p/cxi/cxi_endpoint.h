@@ -4,6 +4,7 @@
 #include "epoll_client.h"
 #include "epoll_server.h"
 #include "util/debug.h"
+#include "util/gpu_rt.h"
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
@@ -17,7 +18,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <cuda_runtime_api.h>
 
 struct CxiMemoryRegion {
   void* addr = nullptr;
@@ -71,7 +71,10 @@ class CxiEndpoint {
                        void* src, size_t size, FifoItem const& fifo_item,
                        UcclRequest* ureq);
 
-  bool check_send_complete_once(uint64_t peer_id, int64_t request_id);
+  // Returns true once the request has completed (successfully or not) and
+  // has been retired. A completion carrying a CQ error sets *failed.
+  bool check_send_complete_once(uint64_t peer_id, int64_t request_id,
+                                bool* failed);
   void send_routine();
   void recv_routine();
   void flush_all_sends() {}

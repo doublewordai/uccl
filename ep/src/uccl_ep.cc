@@ -1388,7 +1388,9 @@ class Buffer {
           use_ue8m0, workspace, num_device_sms, launch_stream, phases,
           d_handles, num_d2h_channel_addrs, max_nvl_peers,
           low_latency_buffer_idx_used, d_ipc_rdma_base_ptrs, rdma_buffer_ptr,
-          atomic_buffer_ptr, buffer.dispatch_rdma_recv_count_buffer_internode);
+          atomic_buffer_ptr, buffer.dispatch_rdma_recv_count_buffer_internode,
+          buffer.dispatch_rdma_x_stage, buffer.dispatch_recv_stage,
+          buffer.dispatch_stage_flag_internode);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
@@ -1503,7 +1505,9 @@ class Buffer {
           num_device_sms, launch_stream, phases, zero_copy, d_handles,
           num_d2h_channel_addrs, max_nvl_peers, low_latency_buffer_idx_used,
           d_ipc_rdma_base_ptrs, rdma_buffer_ptr, atomic_buffer_ptr,
-          buffer.combine_rdma_recv_flag_buffer_internode);
+          buffer.combine_rdma_recv_flag_buffer_internode,
+          buffer.combine_send_stage, buffer.combine_recv_stage,
+          buffer.combine_stage_flag_internode);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
