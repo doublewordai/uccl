@@ -1,13 +1,11 @@
 #pragma once
 
 #include "common.h"
+#include <string>
 #include <vector>
 #include <stddef.h>
 #include <stdint.h>
 
-// Notification buffer capacity; shared with NotifyMsg in common.h (included
-// above). See UCCL_NOTIFY_MSG_SIZE there for the rationale and how to override.
-#define MSG_SIZE UCCL_NOTIFY_MSG_SIZE
 #define FIFO_SIZE 64
 #define IPC_INFO_SIZE 128
 // Handle for the UCCL engine instance
@@ -19,9 +17,11 @@ typedef struct uccl_conn uccl_conn_t;
 // Handle for a memory region
 typedef uint64_t uccl_mr_t;
 
+// Notification message. Variable-length: the payload travels over
+// explicitly-sized channels end to end, so there is no size limit here.
 typedef struct notify_msg {
-  char name[MSG_SIZE];
-  char msg[MSG_SIZE];
+  std::string name;
+  std::string msg;
 } notify_msg_t;
 
 typedef struct md {
@@ -186,12 +186,15 @@ int uccl_engine_write_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
 int uccl_engine_recv(uccl_conn_t* conn, uccl_mr_t mr, void* data,
                      size_t max_size);
 /**
- * Check the status of a transfer.
+ * Poll an asynchronous transfer.
  * @param conn          Connection handle.
  * @param transfer_id   Transfer ID.
- * @return              True if the transfer is done, false otherwise.
+ * @return              1 if the transfer completed successfully, 0 if it is
+ *                      still in progress, -1 if it completed with a transport
+ *                      error. The transfer handle is released in both
+ *                      completed cases.
  */
-bool uccl_engine_xfer_status(uccl_conn_t* conn, uint64_t transfer_id);
+int uccl_engine_xfer_status(uccl_conn_t* conn, uint64_t transfer_id);
 /**
  * Cleanup connection.
  * @param conn          Connection handle to destroy.
@@ -223,7 +226,7 @@ std::vector<notify_msg_t> uccl_engine_get_notifs();
  * Send a notification message.
  * @param conn          Connection handle.
  * @param notify_msg    Notification message.
- * @return              Number of bytes sent, or -1 on failure.
+ * @return              0 on success, -1 on failure.
  */
 int uccl_engine_send_notif(uccl_conn_t* conn, notify_msg_t* notify_msg);
 

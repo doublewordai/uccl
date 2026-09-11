@@ -78,14 +78,14 @@ size_t cxi_size_env(char const* name, size_t fallback) {
 }
 
 bool is_cuda_pointer(void* ptr, int& cuda_device) {
-  cudaPointerAttributes attrs{};
-  cudaError_t err = cudaPointerGetAttributes(&attrs, ptr);
-  if (err != cudaSuccess) {
-    cudaGetLastError();
+  gpuPointerAttribute_t attrs{};
+  gpuError_t err = gpuPointerGetAttributes(&attrs, ptr);
+  if (err != gpuSuccess) {
+    gpuGetLastError();
     return false;
   }
-  if (attrs.type == cudaMemoryTypeDevice ||
-      attrs.type == cudaMemoryTypeManaged) {
+  if (gpuMemTypeOf(attrs) == gpuMemoryTypeDevice ||
+      gpuMemTypeOf(attrs) == gpuMemoryTypeManaged) {
     cuda_device = attrs.device;
     return true;
   }
@@ -457,12 +457,14 @@ void CxiEndpoint::stop_accept() {
 
 void CxiEndpoint::process_meta(std::string const& input, std::string& output,
                                std::string const& client_ip, int client_port) {
-  if (input.size() >= sizeof(NotifyMsg)) {
-    NotifyMsg const* notify_msg =
-        reinterpret_cast<NotifyMsg const*>(input.data());
-    if (notify_msg->magic == NOTIFY_MSG_MAGIC) {
+  {
+    NotifyMsg notify_msg;
+    if (deserialize_notify_msg(input, notify_msg)) {
+      UCCL_LOG(INFO, UCCL_P2P)
+          << "process_meta: received notification from " << notify_msg.name
+          << " (" << notify_msg.msg.size() << " bytes)";
       std::lock_guard<std::mutex> lock(notify_mutex);
-      notify_list.push_back(*notify_msg);
+      notify_list.push_back(std::move(notify_msg));
       output = "";
       return;
     }
@@ -745,8 +747,7 @@ void CxiEndpoint::poll_cq_locked() {
 }
 
 bool CxiEndpoint::check_send_complete_once(uint64_t peer_id,
-                                           int64_t request_id) {
-  (void)peer_id;
+                                           int64_t request_id, bool* failed) {
   poll_cq();
 
   std::lock_guard<std::mutex> lock(op_mutex_);
@@ -754,11 +755,14 @@ bool CxiEndpoint::check_send_complete_once(uint64_t peer_id,
   if (it == inflight_ops_.end()) return true;
   if (!it->second->done) return false;
   if (it->second->failed) {
+    // Fail closed: retire the op and report the error to the caller instead
+    // of aborting the process. The CQ error entry (err/prov_errno/message)
+    // is the decisive line for e.g. a VNI_NOT_FOUND rejection at the target.
     UCCL_LOG(ERROR) << "CXI transfer failed: request_id=" << request_id
                     << " peer_id=" << peer_id << " err=" << it->second->err
                     << " prov_errno=" << it->second->prov_errno << " "
                     << it->second->error_message;
-    std::abort();
+    if (failed) *failed = true;
   }
   inflight_ops_.erase(it);
   return true;
@@ -773,9 +777,8 @@ int CxiEndpoint::send_notification(uint64_t peer_id,
   std::string conn_key = get_oob_conn_key(peer_id);
   if (conn_key.empty() || !oob_client_) return -1;
 
-  std::string payload(reinterpret_cast<char const*>(&notification),
-                      sizeof(NotifyMsg));
-  return oob_client_->send_meta(conn_key, payload) ? sizeof(NotifyMsg) : -1;
+  std::string payload = serialize_notify_msg(notification);
+  return oob_client_->send_meta(conn_key, payload) ? 0 : -1;
 }
 
 void encode_cxi_fifo_metadata(CxiMemoryRegion const& region, FifoItem& item) {

@@ -221,7 +221,8 @@ inline bool uccl_poll_ureq_once(GenericEndpoint const& ep, UcclRequest* ureq) {
           if (ureq->type == ReqType::ReqWrite ||
               ureq->type == ReqType::ReqRead) {
             s->send_routine();
-            return s->check_send_complete_once(ureq->peer_id, ureq->engine_idx);
+            return s->check_send_complete_once(ureq->peer_id, ureq->engine_idx,
+                                               &ureq->failed);
           }
           UCCL_LOG(ERROR) << "Invalid request type: " << ureq->type;
           return false;
@@ -305,7 +306,8 @@ inline bool uccl_check_ureq_once(GenericEndpoint const& ep, UcclRequest* ureq) {
         } else {
           if (ureq->type == ReqType::ReqWrite ||
               ureq->type == ReqType::ReqRead) {
-            return s->check_send_complete_once(ureq->peer_id, ureq->engine_idx);
+            return s->check_send_complete_once(ureq->peer_id, ureq->engine_idx,
+                                               &ureq->failed);
           }
           UCCL_LOG(ERROR) << "Invalid request type: " << ureq->type;
           return false;
