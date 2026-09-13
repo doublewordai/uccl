@@ -381,6 +381,40 @@ __device__ static __forceinline__ void nvshmemi_ibgda_quiet(
   }
 }
 
+// Every lane participates. CXI quiet must cover every ring, but publishing
+// those independent markers need not serialize 32 system-memory commits on
+// one lane. Keep the same per-ring drain and completion requirements.
+__device__ static __forceinline__ void nvshmemi_ibgda_quiet_warp(
+    uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
+    int nvl_rank = -1, int label = -1) {
+#if defined(USE_LIBFABRIC_CXI) && !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+  static_assert(kNumProxyThs * kChannelPerProxy <= WARP_SIZE);
+  EP_DEVICE_ASSERT(num_d2h_channel_addrs == kNumProxyThs * kChannelPerProxy);
+  int const lane = threadIdx.x % WARP_SIZE;
+  d2hq::D2HHandle* h = lane < num_d2h_channel_addrs
+      ? reinterpret_cast<d2hq::D2HHandle*>(
+            static_cast<uintptr_t>(d2h_channel_addrs[lane]))
+      : nullptr;
+  uint64_t slot = 0;
+  if (h) {
+#ifndef USE_MSCCLPP_FIFO_BACKEND
+    while (h->head() - h->tail() >= 1) {}
+#endif
+    TransferCmd cmd{};
+    cmd.cmd_type = CmdType::QUIET;
+    h->atomic_set_and_commit(cmd, &slot);
+  }
+  __syncwarp();
+  if (h) wait_until_cmd_consumed(h, slot, nvl_rank, CmdType::QUIET);
+  __syncwarp();
+#else
+  if (threadIdx.x % WARP_SIZE == 0)
+    nvshmemi_ibgda_quiet(d2h_channel_addrs, num_d2h_channel_addrs,
+                       nvl_rank, label);
+  __syncwarp();
+#endif
+}
+
 __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(
     uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
     int nvl_rank = -1, int label = -1) {

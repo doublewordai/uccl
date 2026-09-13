@@ -154,8 +154,8 @@ __global__ void notify_dispatch(
 
     // waiting for all previous inflight wrs to complete,
     // in case of rewriting cleared rdma_buffer
-    if (thread_id == WARP_SIZE) {
-      uccl::nvshmemi_ibgda_quiet(d2h_channel_addrs, num_d2h_channel_addrs,
+    if (warp_id == 1) {
+      uccl::nvshmemi_ibgda_quiet_warp(d2h_channel_addrs, num_d2h_channel_addrs,
                                  nvl_rank);
     }
     __syncthreads();
@@ -241,8 +241,8 @@ __global__ void notify_dispatch(
     __syncthreads();
 
     // Wait previous operations to be finished
-    if (thread_id == WARP_SIZE) {
-      uccl::nvshmemi_ibgda_quiet(d2h_channel_addrs, num_d2h_channel_addrs,
+    if (warp_id == 1) {
+      uccl::nvshmemi_ibgda_quiet_warp(d2h_channel_addrs, num_d2h_channel_addrs,
                                  nvl_rank);
     }
     __syncthreads();
@@ -1780,8 +1780,8 @@ __global__ void cached_notify(
 
   // Using two SMs, which clean the RDMA/NVL buffer respectively
   if (sm_id == 0) {
-    if (thread_id == WARP_SIZE)
-      uccl::nvshmemi_ibgda_quiet(d2h_channel_addrs, num_d2h_channel_addrs,
+    if (warp_id == 1)
+      uccl::nvshmemi_ibgda_quiet_warp(d2h_channel_addrs, num_d2h_channel_addrs,
                                  nvl_rank, 3);
     __syncthreads();
 
