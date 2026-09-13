@@ -54,6 +54,14 @@ Note:
 * If you hit some `CUDA error: invalid device function`, it is likely that the GPU arch auto-detection fails. You can forcely specify the arch by setting `TORCH_CUDA_ARCH_LIST=gfx950` (eg, default gfx942 for MI300X/MI325X, gfx950 for MI355X) during compilation. 
 * If you hit any weird compilation errors, try `python setup.py clean`.
 
+## CXI proxy CPU placement
+
+With `UCCL_EP_TRANSPORT=cxi`, proxy threads pin themselves to CPUs inside the
+calling task's affinity mask. Provide enough CPUs per rank for its proxy
+threads and the application. HT and LL proxies use separate CPU ordinals;
+ordinals wrap when the allowed CPU set is too small. Set
+`UCCL_EP_CXI_PIN_THREADS=0` to disable CXI proxy pinning.
+
 ## Example APIs
 
 Dispatch and combine: 

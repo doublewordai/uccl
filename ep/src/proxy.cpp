@@ -246,6 +246,27 @@ void Proxy::init_common() {
   ctx_.thread_idx = cfg_.thread_idx;
 
   if (use_cxi_transport()) {
+    const char* pin_env = std::getenv("UCCL_EP_CXI_PIN_THREADS");
+    if (cfg_.pin_thread && (!pin_env || std::string(pin_env) != "0")) {
+      cpu_set_t allowed;
+      CPU_ZERO(&allowed);
+      if (pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed))
+        throw std::runtime_error("Cannot read CXI proxy CPU affinity");
+      std::vector<int> cpus;
+      for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        if (CPU_ISSET(cpu, &allowed)) cpus.push_back(cpu);
+      if (cpus.empty()) throw std::runtime_error("CXI proxy has no allowed CPUs");
+      // Honor the caller's cpuset (for example, a Slurm rank's NUMA-local
+      // cores). Separate HT/LL proxies and ranks that share a CPU mask.
+      const int mode = cfg_.use_normal_mode ? 0 : kNumProxyThs;
+      const int ordinal = mode + cfg_.nic_local_rank * (2 * kNumProxyThs) + cfg_.thread_idx;
+      const size_t reserved = cpus.size() > 2 * kNumProxyThs ? 1 : 0;
+      const int cpu = cpus[reserved + ordinal % (cpus.size() - reserved)];
+      if (!pin_thread_to_cpu(cpu))
+        throw std::runtime_error("Cannot pin CXI proxy to an allowed CPU");
+      printf("CXI proxy rank %d thread %d pinned to allowed CPU %d\n",
+             cfg_.rank, cfg_.thread_idx, cpu);
+    }
     if (ctxs_for_all_ranks_.empty()) {
       fprintf(stderr,
               "Error: peers metadata not set before init_common (peers_.size() "
