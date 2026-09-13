@@ -24,7 +24,7 @@ namespace uccl {
 // to use. The total concurrent warps can be say 64 (= number of experts), while
 // the number of ring buffers is small (say 6).
 template <bool use_normal_mode = false>
-__device__ __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
+__device__ __forceinline__ void nvshmemi_ibgda_put_nbi_warp_single(
     uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_rank,
     int expert_idx, int lane_id, int message_idx,
     uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
@@ -33,6 +33,7 @@ __device__ __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
   // NOTE(MaoZiming): different from the nvshmemi_ibgda_put_nbi_warp in
   // ibgda_device.cuh, we don't do warp-cooperation.
   if (lane_id != 0) return;
+  EP_DEVICE_ASSERT(bytes <= 0xffffffu && "WRITE length exceeds the 24-bit command field");
   int thread_idx = (expert_idx % num_d2h_channel_addrs) % kNumProxyThs;
   int per_thread_d2h_channel_idx =
       (expert_idx % num_d2h_channel_addrs) / kNumProxyThs;
@@ -171,6 +172,43 @@ __device__ __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
     }
   }
 #endif
+}
+
+// Batched LL writes must fit both packed command fields. Splitting here also
+// covers optional coalescing callers without duplicating their staging logic.
+// Chunks stay on the same ring, so a following count/arrival command still
+// orders after the entire payload.
+template <bool use_normal_mode = false>
+__device__ __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
+    uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_rank,
+    int expert_idx, int lane_id, int message_idx,
+    uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
+    bool is_combine, int low_latency_buffer_idx = 0, uint64_t atomic_offset = 0,
+    uint64_t atomic_val = 0, int num_tokens = 1) {
+  if (lane_id != 0) return;
+  if constexpr (!use_normal_mode) {
+    if (bytes > 0xffffffu || num_tokens > static_cast<int>(kLLNumTokensMax)) {
+      EP_DEVICE_ASSERT(num_tokens > 0 && bytes % num_tokens == 0);
+      const size_t bytes_per_token = bytes / num_tokens;
+      EP_DEVICE_ASSERT(bytes_per_token > 0 && bytes_per_token <= 0xffffffu);
+      const int byte_limit = static_cast<int>(0xffffffu / bytes_per_token);
+      const int chunk_tokens = min(byte_limit, static_cast<int>(kLLNumTokensMax));
+      for (int first = 0; first < num_tokens; first += chunk_tokens) {
+        const int count = min(chunk_tokens, num_tokens - first);
+        const size_t offset = static_cast<size_t>(first) * bytes_per_token;
+        nvshmemi_ibgda_put_nbi_warp_single<false>(
+            req_rptr + offset, req_lptr + offset, count * bytes_per_token,
+            dst_rank, expert_idx, lane_id, message_idx + first,
+            d2h_channel_addrs, num_d2h_channel_addrs, is_combine,
+            low_latency_buffer_idx, atomic_offset, atomic_val, count);
+      }
+      return;
+    }
+  }
+  nvshmemi_ibgda_put_nbi_warp_single<use_normal_mode>(
+      req_rptr, req_lptr, bytes, dst_rank, expert_idx, lane_id, message_idx,
+      d2h_channel_addrs, num_d2h_channel_addrs, is_combine,
+      low_latency_buffer_idx, atomic_offset, atomic_val, num_tokens);
 }
 
 // TODO(MaoZiming): Fix. This should be a non-fetch add operation. This could be
