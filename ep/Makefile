@@ -139,12 +139,37 @@ ifeq ($(LANE_E_DISPATCH_INDIRECT),1)
   override NVCCFLAGS += -DLANE_E_DISPATCH_INDIRECT
 endif
 
+# Share one dispatch payload across all GPUs on the destination node.
+LANE_E_DISPATCH_NODE ?= 0
+ifeq ($(LANE_E_DISPATCH_NODE),1)
+  ifneq ($(LANE_E_DESTRANK_COALESCE),1)
+    $(error LANE_E_DISPATCH_NODE requires LANE_E_DESTRANK_COALESCE=1)
+  endif
+  ifneq ($(LANE_E_DISPATCH_INDIRECT),1)
+    $(error LANE_E_DISPATCH_NODE requires LANE_E_DISPATCH_INDIRECT=1)
+  endif
+  override CXXFLAGS += -DLANE_E_DISPATCH_NODE
+  override NVCCFLAGS += -DLANE_E_DISPATCH_NODE
+endif
+
 # Lane E: dest-rank coalescing combine-LL path (default: disabled).
 # Intended to be built together with LANE_E_DESTRANK_COALESCE.
 LANE_E_COMBINE_COALESCE ?= 0
 ifeq ($(LANE_E_COMBINE_COALESCE),1)
   override CXXFLAGS += -DLANE_E_COMBINE_COALESCE
   override NVCCFLAGS += -DLANE_E_COMBINE_COALESCE
+endif
+
+# Pack coalesced BF16 combine messages directly from the supplied expert output.
+# This removes the redundant full per-expert send arena. Native zero-copy and
+# LogFMT inputs are rejected because they require that arena or its transform.
+LANE_E_COMBINE_DIRECT_SEND ?= 0
+ifeq ($(LANE_E_COMBINE_DIRECT_SEND),1)
+  ifneq ($(LANE_E_COMBINE_COALESCE),1)
+    $(error LANE_E_COMBINE_DIRECT_SEND requires LANE_E_COMBINE_COALESCE=1)
+  endif
+  override CXXFLAGS += -DLANE_E_COMBINE_DIRECT_SEND
+  override NVCCFLAGS += -DLANE_E_COMBINE_DIRECT_SEND
 endif
 
 ifdef NUM_MAX_NVL_PEERS

@@ -32,7 +32,9 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               // Lane E dest-rank coalescing staging (unused unless
               // LANE_E_DESTRANK_COALESCE is compiled in).
               void* rdma_x_stage = nullptr, void* recv_stage = nullptr,
-              int64_t* stage_flag_internode = nullptr);
+              int64_t* stage_flag_internode = nullptr,
+              void** ipc_nvl_base_ptrs = nullptr,
+              size_t node_control_offset = 0);
 
 void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              void* rdma_send_x, void const* x, int64_t const* topk_idx,

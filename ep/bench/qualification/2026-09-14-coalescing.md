@@ -17,8 +17,9 @@ coalescing supports top-k at most 8 and at most 64 experts per GPU. Every rank
 must use the same build: deduplication changes the staged dispatch header.
 Single-node dispatch does not use the remote expert mask. Relative to the existing coalesced path, buffer
 capacity and staging lifetime are retained; indirection replaces payload copies
-with message indices in the old receive slots. There are no extra asynchronous
-consumers of the staging arena.
+with message indices in the old receive slots. With node sharing disabled, there are no extra asynchronous
+consumers of the staging arena. The optional [node-shared dispatch extension](2026-09-14-node-dispatch.md)
+adds explicit peer-reader acknowledgements and separate qualification.
 
 ## Complete-MoE result
 
