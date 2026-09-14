@@ -139,6 +139,19 @@ ifeq ($(LANE_E_DISPATCH_INDIRECT),1)
   override NVCCFLAGS += -DLANE_E_DISPATCH_INDIRECT
 endif
 
+# Share one dispatch payload across all GPUs on the destination node.
+LANE_E_DISPATCH_NODE ?= 0
+ifeq ($(LANE_E_DISPATCH_NODE),1)
+  ifneq ($(LANE_E_DESTRANK_COALESCE),1)
+    $(error LANE_E_DISPATCH_NODE requires LANE_E_DESTRANK_COALESCE=1)
+  endif
+  ifneq ($(LANE_E_DISPATCH_INDIRECT),1)
+    $(error LANE_E_DISPATCH_NODE requires LANE_E_DISPATCH_INDIRECT=1)
+  endif
+  override CXXFLAGS += -DLANE_E_DISPATCH_NODE
+  override NVCCFLAGS += -DLANE_E_DISPATCH_NODE
+endif
+
 # Lane E: dest-rank coalescing combine-LL path (default: disabled).
 # Intended to be built together with LANE_E_DESTRANK_COALESCE.
 LANE_E_COMBINE_COALESCE ?= 0
