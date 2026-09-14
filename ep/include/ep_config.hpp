@@ -153,6 +153,27 @@ struct LowLatencyBuffer {
   void* combine_rdma_send_buffer_data_start = nullptr;
   size_t num_bytes_per_combine_msg = 0;
 
+  // Lane E dest-rank coalescing (LANE_E_DESTRANK_COALESCE). All default null
+  // and unused unless that path is compiled in.
+  //  - dispatch_rdma_x_stage: per-dst-rank contiguous send staging, lives
+  //    inside the dispatch send buffer just past the per-token temp region.
+  //  - dispatch_recv_stage: symmetric per-src-rank contiguous recv staging,
+  //    the target of the coalesced put (one large write per remote dst rank).
+  //  - dispatch_stage_flag_internode: per-src-rank arrival flag, an RDMA-atomic
+  //    target carved out of the internode signaling region just past the
+  //    per-expert counts.
+  void* dispatch_rdma_x_stage = nullptr;
+  void* dispatch_recv_stage = nullptr;
+  int64_t* dispatch_stage_flag_internode = nullptr;
+
+  // Lane E combine-side coalescing (LANE_E_COMBINE_COALESCE). Same shape as the
+  // dispatch staging but for the bf16 combine message, with a 16-byte
+  // (global_expert, src_idx) header per staged token so the recv scatter can
+  // place it at rdma_recv_x[global_expert*maxtok + src_idx].
+  void* combine_send_stage = nullptr;
+  void* combine_recv_stage = nullptr;
+  int64_t* combine_stage_flag_internode = nullptr;
+
   // TODO(MaoZiming)
   std::tuple<int*, int64_t*, int> clean_meta() {
     EP_HOST_ASSERT(dispatch_rdma_recv_count_buffer ==
@@ -195,8 +216,44 @@ struct LowLatencyLayout {
                                 hidden + num_scales * sizeof(float));
     size_t num_bytes_per_combine_msg = hidden * sizeof(nv_bfloat16);
 
+#ifdef LANE_E_DESTRANK_COALESCE
+    // Dest-rank coalescing staging sizes. A rank stages, per destination rank,
+    // one message per token per local expert of that destination, bounded by
+    // the top-k fan-out. GLM decode uses k=8; a per-token cap of 8 covers it
+    // (dispatch launch asserts num_topk <= 8 when this path is active).
+    int const num_local_experts_ll = num_experts / num_ranks;
+    size_t const coalesce_max_msgs_per_dst =
+        static_cast<size_t>(num_max_dispatch_tokens_per_rank) *
+        static_cast<size_t>(std::min(num_local_experts_ll, 8));
+    size_t const coalesce_stage_bytes_per_rank =
+        coalesce_max_msgs_per_dst * num_bytes_per_dispatch_msg;
+    size_t const coalesce_stage_region_bytes =
+        static_cast<size_t>(num_ranks) * coalesce_stage_bytes_per_rank;
+#endif
+
+#ifdef LANE_E_COMBINE_COALESCE
+    // Combine staging: bf16 message + a 16-byte (global_expert, src_idx) header.
+    int const num_local_experts_cmb = num_experts / num_ranks;
+    size_t const cmb_max_msgs_per_dst =
+        static_cast<size_t>(num_max_dispatch_tokens_per_rank) *
+        static_cast<size_t>(std::min(num_local_experts_cmb, 8));
+    size_t const cmb_stage_entry_bytes =
+        sizeof(int4) + num_bytes_per_combine_msg;
+    size_t const cmb_stage_bytes_per_rank =
+        cmb_max_msgs_per_dst * cmb_stage_entry_bytes;
+    size_t const cmb_stage_region_bytes =
+        static_cast<size_t>(num_ranks) * cmb_stage_bytes_per_rank;
+#endif
+
     // Send buffer
-#ifdef PER_EXPERT_BATCHING
+#if defined(LANE_E_DESTRANK_COALESCE)
+    // Per-token temp region (FP8 cast target) followed by the per-dst-rank
+    // send staging that the coalesced put reads from.
+    size_t dispatch_send_buffer_bytes =
+        static_cast<size_t>(num_max_dispatch_tokens_per_rank) *
+            num_bytes_per_dispatch_msg +
+        coalesce_stage_region_bytes;
+#elif defined(PER_EXPERT_BATCHING)
     // Buffer layout for RDMA sends, used by the batched RDMA-send path in the
     // dispatch-LL kernel.
     // clang-format off
@@ -239,8 +296,43 @@ struct LowLatencyLayout {
     EP_HOST_ASSERT(recv_buffer_bytes % sizeof(int4) == 0);
     total_bytes += recv_buffer_bytes * 2;
 
+#ifdef LANE_E_DESTRANK_COALESCE
+    // Symmetric per-src-rank recv staging (target of the coalesced put), placed
+    // after the send/recv buffers. Same size as the send staging region.
+    size_t const recv_stage_region_bytes = coalesce_stage_region_bytes;
+    EP_HOST_ASSERT(recv_stage_region_bytes % sizeof(int4) == 0);
+    total_bytes += recv_stage_region_bytes * 2;
+#endif
+
+#ifdef LANE_E_COMBINE_COALESCE
+    // Combine send + recv staging (both symmetric, double-buffered).
+    EP_HOST_ASSERT(cmb_stage_region_bytes % sizeof(int4) == 0);
+    total_bytes += cmb_stage_region_bytes * 2;  // send stage
+    total_bytes += cmb_stage_region_bytes * 2;  // recv stage
+#endif
+
+    // Number of extra per-src arrival-flag slots appended after the per-expert
+    // internode counts: num_ranks for dispatch coalescing, another num_ranks for
+    // combine coalescing (separate slots — dispatch and combine reuse the same
+    // buffer index within a step, so their flags must not alias).
+    size_t coalesce_extra_flag_slots = 0;
+#ifdef LANE_E_DESTRANK_COALESCE
+    coalesce_extra_flag_slots += num_ranks;
+#endif
+#ifdef LANE_E_COMBINE_COALESCE
+    coalesce_extra_flag_slots += num_ranks;
+#endif
+
     // Symmetric signaling buffers
-#ifdef PER_EXPERT_BATCHING
+#if defined(LANE_E_DESTRANK_COALESCE) || defined(LANE_E_COMBINE_COALESCE)
+    // Coalesce keeps the per-expert internode counts (written locally by the
+    // recv scatter) and appends per-src arrival flags. The int signaling
+    // buffer's element count drives the clean loop that zeroes both int and
+    // int64 signaling regions, so size it to cover counts + all flags.
+    size_t dispatch_recv_count_buffer_bytes =
+        (static_cast<size_t>(num_experts) + coalesce_extra_flag_slots) *
+        sizeof(int);
+#elif defined(PER_EXPERT_BATCHING)
     // Batched dispatch needs one count per (dst_rank, src_rank).
     size_t dispatch_recv_count_buffer_bytes =
         static_cast<size_t>(num_ranks * num_ranks) * sizeof(int);
@@ -256,7 +348,13 @@ struct LowLatencyLayout {
     total_bytes += signaling_buffer_bytes_aligned * 2;
 
     // Internode signaling buffers (for RDMA atomics): use 64-bit slots.
-#ifdef PER_EXPERT_BATCHING
+#if defined(LANE_E_DESTRANK_COALESCE) || defined(LANE_E_COMBINE_COALESCE)
+    // Per-expert internode counts/flags followed by the per-src arrival flags,
+    // contiguous so the clean loop covers both.
+    size_t dispatch_recv_count_buffer_bytes_internode =
+        (static_cast<size_t>(num_experts) + coalesce_extra_flag_slots) *
+        sizeof(int64_t);
+#elif defined(PER_EXPERT_BATCHING)
     // Batched dispatch needs one count per (dst_rank, src_rank).
     size_t dispatch_recv_count_buffer_bytes_internode =
         static_cast<size_t>(num_ranks * num_ranks) * sizeof(int64_t);
@@ -312,6 +410,51 @@ struct LowLatencyLayout {
                   signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
           num_bytes_per_combine_msg};
     }
+
+#ifdef LANE_E_DESTRANK_COALESCE
+    // Coalesce staging pointers (appended after the base LowLatencyBuffer
+    // fields). Send staging lives inside the send buffer past the per-token
+    // temp; recv staging is its own symmetric region after the recv buffers;
+    // the per-src arrival flags sit just past the per-expert internode counts.
+    for (int i = 0; i < 2; ++i) {
+      buffers[i].dispatch_rdma_x_stage =
+          advance(buffers[i].dispatch_rdma_send_buffer,
+                  static_cast<size_t>(num_max_dispatch_tokens_per_rank) *
+                      num_bytes_per_dispatch_msg);
+      buffers[i].dispatch_recv_stage =
+          advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 +
+                                   send_buffer_bytes * 2 + recv_buffer_bytes * 2 +
+                                   recv_stage_region_bytes * i);
+      buffers[i].dispatch_stage_flag_internode =
+          buffers[i].dispatch_rdma_recv_count_buffer_internode + num_experts;
+    }
+#endif
+
+#ifdef LANE_E_COMBINE_COALESCE
+    // Combine staging sits after the dispatch recv-stage region (if present).
+    size_t combine_region_base =
+        signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 +
+        recv_buffer_bytes * 2;
+#ifdef LANE_E_DESTRANK_COALESCE
+    combine_region_base += recv_stage_region_bytes * 2;
+#endif
+    // Combine flags follow the per-expert counts and the dispatch flags (if any).
+    size_t combine_flag_offset = num_experts;
+#ifdef LANE_E_DESTRANK_COALESCE
+    combine_flag_offset += num_ranks;
+#endif
+    for (int i = 0; i < 2; ++i) {
+      buffers[i].combine_send_stage =
+          advance(rdma_buffer, combine_region_base + cmb_stage_region_bytes * i);
+      buffers[i].combine_recv_stage =
+          advance(rdma_buffer, combine_region_base +
+                                   cmb_stage_region_bytes * 2 +
+                                   cmb_stage_region_bytes * i);
+      buffers[i].combine_stage_flag_internode =
+          buffers[i].dispatch_rdma_recv_count_buffer_internode +
+          combine_flag_offset;
+    }
+#endif
   }
 };
 
