@@ -1,0 +1,30 @@
+{
+  "hardware": "8 GH200 GPUs across 2 Isambard nodes",
+  "compiler": "GCC 13.2, CUDA 13.0.88 from vLLM 0.28.0 environment; external compiler selection override for upstream-base Makefile",
+  "test_sha256": "f397f019a4b7afb33111c445a38c111590c1ef3c72504a87ac791bc26050ee21",
+  "enabled_extension_sha256": "a5f94980ef7a8a7825cff2614575806d46a1b3e507e568bb32b9b4492022e137",
+  "disabled_extension_sha256": "036791ba27a2ae5951bee1e9d6f10e54968c7d41ab0ec70412d21bd853fb0bc1",
+  "records": [
+    {
+      "log": "coalescing-pr-graph-bf16-exact-ep8.log",
+      "log_sha256": "faa9289e40129ed7d08dcb598f1f1c6949c830168714cbcec32a193ffb4acd6b",
+      "build": "all_enabled",
+      "args": "--hidden 7168 --experts 512 --topk 8 --duplicates --unbarriered",
+      "result": "PASS 10 eager calls + 48 captured calls + true empty/ragged inputs, exact routing metadata, max global relL2 0.001955"
+    },
+    {
+      "log": "coalescing-pr-graph-fp8-unbarriered-ep8.log",
+      "log_sha256": "6decf0bbfab70c1f073316200d04c852394b6f2878a6626f4ca5fbb542c5a1b3",
+      "build": "all_enabled",
+      "args": "--hidden 6144 --experts 512 --topk 8 --fp8 --duplicates --unbarriered",
+      "result": "PASS 10 eager calls + 48 captured calls + true empty/ragged inputs, exact routing metadata, max global relL2 0.025362"
+    },
+    {
+      "log": "coalescing-pr-default-bf16-ep8.log",
+      "log_sha256": "6ea4fbe91eb6e30afd987b4d27a4cd33b39d169d92a96ca73c9bb6e17e48b734",
+      "build": "all_disabled",
+      "args": "--hidden 7168 --experts 512 --topk 8 --duplicates --unbarriered",
+      "result": "PASS 10 eager calls + 48 captured calls + true empty/ragged inputs, exact routing metadata, max global relL2 0.001955"
+    }
+  ]
+}

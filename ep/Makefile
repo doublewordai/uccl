@@ -109,6 +109,69 @@ ifeq ($(PER_EXPERT_BATCHING),1)
   override NVCCFLAGS += -DPER_EXPERT_BATCHING
 endif
 
+# Lane E: dest-rank coalescing dispatch-LL path (default: disabled).
+# Independent of PER_EXPERT_BATCHING; do not set both.
+LANE_E_DESTRANK_COALESCE ?= 0
+ifeq ($(LANE_E_DESTRANK_COALESCE),1)
+  ifeq ($(PER_EXPERT_BATCHING),1)
+    $(error LANE_E_DESTRANK_COALESCE and PER_EXPERT_BATCHING are mutually exclusive)
+  endif
+  override CXXFLAGS += -DLANE_E_DESTRANK_COALESCE
+  override NVCCFLAGS += -DLANE_E_DESTRANK_COALESCE
+endif
+
+# Send one payload per token and remote rank, with a local-expert bitmask.
+# All ranks must use the same setting because this changes the staged header.
+LANE_E_DISPATCH_DEDUP ?= 0
+ifeq ($(LANE_E_DISPATCH_DEDUP),1)
+  ifneq ($(LANE_E_DESTRANK_COALESCE),1)
+    $(error LANE_E_DISPATCH_DEDUP requires LANE_E_DESTRANK_COALESCE=1)
+  endif
+  override NVCCFLAGS += -DLANE_E_DISPATCH_DEDUP
+endif
+
+# Consume remote payloads directly from staging after publishing slot indices.
+LANE_E_DISPATCH_INDIRECT ?= 0
+ifeq ($(LANE_E_DISPATCH_INDIRECT),1)
+  ifneq ($(LANE_E_DESTRANK_COALESCE),1)
+    $(error LANE_E_DISPATCH_INDIRECT requires LANE_E_DESTRANK_COALESCE=1)
+  endif
+  override NVCCFLAGS += -DLANE_E_DISPATCH_INDIRECT
+endif
+
+# Share one dispatch payload across all GPUs on the destination node.
+LANE_E_DISPATCH_NODE ?= 0
+ifeq ($(LANE_E_DISPATCH_NODE),1)
+  ifneq ($(LANE_E_DESTRANK_COALESCE),1)
+    $(error LANE_E_DISPATCH_NODE requires LANE_E_DESTRANK_COALESCE=1)
+  endif
+  ifneq ($(LANE_E_DISPATCH_INDIRECT),1)
+    $(error LANE_E_DISPATCH_NODE requires LANE_E_DISPATCH_INDIRECT=1)
+  endif
+  override CXXFLAGS += -DLANE_E_DISPATCH_NODE
+  override NVCCFLAGS += -DLANE_E_DISPATCH_NODE
+endif
+
+# Lane E: dest-rank coalescing combine-LL path (default: disabled).
+# Intended to be built together with LANE_E_DESTRANK_COALESCE.
+LANE_E_COMBINE_COALESCE ?= 0
+ifeq ($(LANE_E_COMBINE_COALESCE),1)
+  override CXXFLAGS += -DLANE_E_COMBINE_COALESCE
+  override NVCCFLAGS += -DLANE_E_COMBINE_COALESCE
+endif
+
+# Pack coalesced BF16 combine messages directly from the supplied expert output.
+# This removes the redundant full per-expert send arena. Native zero-copy and
+# LogFMT inputs are rejected because they require that arena or its transform.
+LANE_E_COMBINE_DIRECT_SEND ?= 0
+ifeq ($(LANE_E_COMBINE_DIRECT_SEND),1)
+  ifneq ($(LANE_E_COMBINE_COALESCE),1)
+    $(error LANE_E_COMBINE_DIRECT_SEND requires LANE_E_COMBINE_COALESCE=1)
+  endif
+  override CXXFLAGS += -DLANE_E_COMBINE_DIRECT_SEND
+  override NVCCFLAGS += -DLANE_E_COMBINE_DIRECT_SEND
+endif
+
 ifdef NUM_MAX_NVL_PEERS
   override CXXFLAGS += -DNUM_MAX_NVL_PEERS=$(NUM_MAX_NVL_PEERS)
   override NVCCFLAGS += -DNUM_MAX_NVL_PEERS=$(NUM_MAX_NVL_PEERS)
@@ -191,3 +254,12 @@ clean:
 # Automatically include dependency files if they exist
 DEPS := $(OBJ_CPP:.o=.d) $(OBJ_CC:.o=.d) $(OBJ_CC_LIB:.o=.d) $(OBJ_CU:.o=.d) $(OBJ_BIND:.o=.d)
 -include $(DEPS)
+
+# Consume remote expert outputs directly from the coalesced staging buffer.
+LANE_E_COMBINE_INDIRECT ?= 0
+ifeq ($(LANE_E_COMBINE_INDIRECT),1)
+  ifneq ($(LANE_E_COMBINE_COALESCE),1)
+    $(error LANE_E_COMBINE_INDIRECT requires LANE_E_COMBINE_COALESCE=1)
+  endif
+  override NVCCFLAGS += -DLANE_E_COMBINE_INDIRECT
+endif
