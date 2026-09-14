@@ -113,8 +113,30 @@ endif
 # Independent of PER_EXPERT_BATCHING; do not set both.
 LANE_E_DESTRANK_COALESCE ?= 0
 ifeq ($(LANE_E_DESTRANK_COALESCE),1)
+  ifeq ($(PER_EXPERT_BATCHING),1)
+    $(error LANE_E_DESTRANK_COALESCE and PER_EXPERT_BATCHING are mutually exclusive)
+  endif
   override CXXFLAGS += -DLANE_E_DESTRANK_COALESCE
   override NVCCFLAGS += -DLANE_E_DESTRANK_COALESCE
+endif
+
+# Send one payload per token and remote rank, with a local-expert bitmask.
+# All ranks must use the same setting because this changes the staged header.
+LANE_E_DISPATCH_DEDUP ?= 0
+ifeq ($(LANE_E_DISPATCH_DEDUP),1)
+  ifneq ($(LANE_E_DESTRANK_COALESCE),1)
+    $(error LANE_E_DISPATCH_DEDUP requires LANE_E_DESTRANK_COALESCE=1)
+  endif
+  override NVCCFLAGS += -DLANE_E_DISPATCH_DEDUP
+endif
+
+# Consume remote payloads directly from staging after publishing slot indices.
+LANE_E_DISPATCH_INDIRECT ?= 0
+ifeq ($(LANE_E_DISPATCH_INDIRECT),1)
+  ifneq ($(LANE_E_DESTRANK_COALESCE),1)
+    $(error LANE_E_DISPATCH_INDIRECT requires LANE_E_DESTRANK_COALESCE=1)
+  endif
+  override NVCCFLAGS += -DLANE_E_DISPATCH_INDIRECT
 endif
 
 # Lane E: dest-rank coalescing combine-LL path (default: disabled).
@@ -207,3 +229,12 @@ clean:
 # Automatically include dependency files if they exist
 DEPS := $(OBJ_CPP:.o=.d) $(OBJ_CC:.o=.d) $(OBJ_CC_LIB:.o=.d) $(OBJ_CU:.o=.d) $(OBJ_BIND:.o=.d)
 -include $(DEPS)
+
+# Consume remote expert outputs directly from the coalesced staging buffer.
+LANE_E_COMBINE_INDIRECT ?= 0
+ifeq ($(LANE_E_COMBINE_INDIRECT),1)
+  ifneq ($(LANE_E_COMBINE_COALESCE),1)
+    $(error LANE_E_COMBINE_INDIRECT requires LANE_E_COMBINE_COALESCE=1)
+  endif
+  override NVCCFLAGS += -DLANE_E_COMBINE_INDIRECT
+endif

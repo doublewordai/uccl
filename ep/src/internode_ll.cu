@@ -282,6 +282,28 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
           // int (header[1]) of the *staged* copy — the per-token temp header
           // is shared across this token's top-k warps, so it must not be
           // written there.
+#ifdef LANE_E_DISPATCH_DEDUP
+          // A destination rank needs one payload per source token, even when
+          // several local experts select it. Preserve repeated expert IDs by
+          // sending one additional single-expert message per repeated route.
+          uint64_t expert_mask = 0;
+          int emit = 1;
+          if (lane_id == 0) {
+            bool first_rank_route = true, repeated_expert = false;
+            for (int j = 0; j < num_topk; ++j) {
+              int const expert = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + j));
+              if (expert >= 0 && expert / num_local_experts == dst_rank) {
+                expert_mask |= 1ULL << (expert % num_local_experts);
+                if (j < warp_id) first_rank_route = false;
+                if (j < warp_id && expert == dst_expert_idx) repeated_expert = true;
+              }
+            }
+            emit = first_rank_route || repeated_expert;
+            if (!first_rank_route) expert_mask = 1ULL << dst_expert_local_idx;
+          }
+          emit = __shfl_sync(WARP_MASK, emit, 0);
+          if (emit) {
+#endif
           int stage_pos =
               lane_id == 0 ? atomicAdd(stage_send_count + dst_rank, 1) : 0;
           stage_pos = __shfl_sync(WARP_MASK, stage_pos, 0);
@@ -294,8 +316,17 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
           UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, stage_dst_int4,
                              stage_src_int4, ld_nc_global, st_na_global);
           __syncwarp();
-          if (lane_id == 0)
+          if (lane_id == 0) {
+#ifdef LANE_E_DISPATCH_DEDUP
+            reinterpret_cast<uint32_t*>(stage_dst_u8)[1] = static_cast<uint32_t>(expert_mask);
+            reinterpret_cast<uint32_t*>(stage_dst_u8)[2] = static_cast<uint32_t>(expert_mask >> 32);
+#else
             reinterpret_cast<int*>(stage_dst_u8)[1] = dst_expert_local_idx;
+#endif
+          }
+#ifdef LANE_E_DISPATCH_DEDUP
+          }
+#endif
 #elif defined(PER_EXPERT_BATCHING)
           // For inter-node send path, copy temp data to the per-expert batch
           // buffer, then issue a batched RDMA send.
@@ -643,7 +674,15 @@ LOW_LATENCY_DISPATCH_RECV:
                             scatter_src_rank * coalesce_stage_bytes_per_rank;
       for (int t = sub_warp_id; t < total; t += num_warps_per_group) {
         auto* msg_u8 = src_base + static_cast<size_t>(t) * num_bytes_per_msg;
+#ifdef LANE_E_DISPATCH_DEDUP
+        uint64_t mask = static_cast<uint64_t>(reinterpret_cast<uint32_t const*>(msg_u8)[1]) |
+                        (static_cast<uint64_t>(reinterpret_cast<uint32_t const*>(msg_u8)[2]) << 32);
+        while (mask) {
+          int const le = __ffsll(static_cast<long long>(mask)) - 1;
+          mask &= mask - 1;
+#else
         int const le = reinterpret_cast<int const*>(msg_u8)[1];
+#endif
         int slot = lane_id == 0 ? atomicAdd(&slot_row[le], 1) : 0;
         slot = __shfl_sync(WARP_MASK, slot, 0);
         auto* dst_u8 =
@@ -654,10 +693,19 @@ LOW_LATENCY_DISPATCH_RECV:
                  num_max_dispatch_tokens_per_rank +
              slot) *
                 num_bytes_per_msg;
+#ifdef LANE_E_DISPATCH_INDIRECT
+        // The receive stage remains live through this dispatch. Publish only
+        // its message index; the final expert-pack pass reads the payload there.
+        if (lane_id == 0) *reinterpret_cast<int*>(dst_u8) = t;
+#else
         UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg,
                            reinterpret_cast<int4*>(dst_u8),
                            reinterpret_cast<int4 const*>(msg_u8), ld_nc_global,
                            st_na_global);
+#endif
+#ifdef LANE_E_DISPATCH_DEDUP
+        }
+#endif
       }
       sync_barrier<true>(warp_group_id + 2, group_threads);
 
@@ -794,8 +842,17 @@ LOW_LATENCY_DISPATCH_RECV:
     EP_DEVICE_ASSERT(num_scales <= 64);
     for (int i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group) {
       // Copy source info
-      auto const src_src_idx =
+      auto* src_src_idx =
           reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
+#ifdef LANE_E_DISPATCH_INDIRECT
+      if (src_rank / max_nvl_peers != rank / max_nvl_peers) {
+        int const staged_index = ld_nc_global(src_src_idx);
+        src_src_idx = reinterpret_cast<int*>(
+            static_cast<uint8_t*>(recv_stage) +
+            src_rank * coalesce_stage_bytes_per_rank +
+            static_cast<size_t>(staged_index) * num_bytes_per_msg);
+      }
+#endif
       if (lane_id == 0)
         recv_src_info[recv_token_begin_idx + i] = ld_nc_global(src_src_idx);
       __syncwarp();
@@ -864,6 +921,9 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int64_t* stage_flag_internode) {
   constexpr int kNumMaxTopK = 16;
 #ifdef LANE_E_DESTRANK_COALESCE
+  // Remote scatter uses 64 local-expert counters (and dedup a 64-bit mask).
+  EP_HOST_ASSERT((num_ranks <= max_nvl_peers || num_experts / num_ranks <= 64) &&
+                 "coalesced remote dispatch supports at most 64 local experts");
   // The coalesce staging is sized for a per-token fan-out cap of 8.
   EP_HOST_ASSERT(num_topk <= 8 &&
                  "LANE_E_DESTRANK_COALESCE staging assumes num_topk <= 8");
@@ -1452,11 +1512,15 @@ LOW_LATENCY_COMBINE_RECV:
             static_cast<uint8_t*>(rdma_recv_x) +
             (static_cast<size_t>(ge) * num_max_dispatch_tokens_per_rank + si) *
                 num_bytes_per_slot;
+#ifdef LANE_E_COMBINE_INDIRECT
+        if (lane_id == 0) *reinterpret_cast<int*>(dst_u8) = t;
+#else
         auto const* msg_int4 =
             reinterpret_cast<int4 const*>(entry + sizeof(int4));
         UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4,
                            reinterpret_cast<int4*>(dst_u8), msg_int4,
                            ld_nc_global, st_na_global);
+#endif
       }
       sync_barrier<true>(warp_group_id + 2, group_threads);
       // Publish this source rank's per-expert arrival flags.
@@ -1559,6 +1623,16 @@ LOW_LATENCY_COMBINE_RECV:
                   num_bytes_per_slot);
           auto rdma_buffer_row =
               reinterpret_cast<uint8_t const*>(rdma_buffer_type);
+#ifdef LANE_E_COMBINE_INDIRECT
+          int const expert_rank = reg_topk_idx[i] / num_local_experts;
+          if (expert_rank / max_nvl_peers != rank / max_nvl_peers) {
+            int const staged_index = ld_nc_global(rdma_buffer_type);
+            rdma_buffer_row = static_cast<uint8_t const*>(combine_recv_stage) +
+                expert_rank * cmb_stage_bytes_per_rank +
+                static_cast<size_t>(staged_index) * cmb_stage_entry_bytes +
+                sizeof(int4);
+          }
+#endif
 
           // Reduce
           auto x_vec = ld_nc_global(
