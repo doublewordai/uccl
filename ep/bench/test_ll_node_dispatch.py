@@ -65,8 +65,14 @@ def main():
         target = (
             (r // local_world + 1) % (world // local_world)
         ) * local_world + r % local_world
-        mode = trial % 5
-        if mode in (0, 2, 4):
+        mode = trial % 7
+        # Force one GPU to consume all remote rows while other gateways wait
+        # for its read-completion acknowledgement (including expert byte 255).
+        if mode in (5, 6):
+            target = (target // local_world) * local_world + (
+                0 if mode == 5 else local_world - 1
+            )
+        if mode in (0, 2, 4, 5, 6):
             choices = (target * G + (G - K) + slots).expand(T, K).clone()
         else:
             choices = (r * G + rows * 3 + slots * G) % a.experts
@@ -223,7 +229,7 @@ def main():
     # Reuse both ping-pong buffers across different capacity/precision layouts.
     actual = T // 2
     for i, capacity in enumerate([T, T // 2, T // 2, T]):
-        trial = 200 + 5 * i  # distinct hot experts, not duplicate-capacity stress
+        trial = 210 + 7 * i  # distinct hot experts, not duplicate-capacity stress
         inputs(trial)
         result = roundtrip(
             x[:actual],
