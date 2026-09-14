@@ -1247,10 +1247,12 @@ __global__ __launch_bounds__(1024, 1) void combine(
                                           hidden_bf16_int4;
     auto const local_src_info = src_info + local_expert_idx * num_ranks *
                                                num_max_dispatch_tokens_per_rank;
+#ifndef LANE_E_COMBINE_DIRECT_SEND
     auto const rdma_send_x_vec = static_cast<uint8_t*>(rdma_send_x) +
                                  local_expert_idx * num_ranks *
                                      num_max_dispatch_tokens_per_rank *
                                      num_bytes_per_slot;
+#endif
 
     // Unpack layout
     int offset, num_tokens_to_send;
@@ -1304,14 +1306,18 @@ __global__ __launch_bounds__(1024, 1) void combine(
          token_idx < offset + num_tokens_to_send;
          token_idx += num_warps_per_group) {
       auto const x_int4 = local_x + token_idx * hidden_bf16_int4;
+#ifndef LANE_E_COMBINE_DIRECT_SEND
       auto const rdma_send_type_row = reinterpret_cast<int*>(
           rdma_send_x_vec + token_idx * num_bytes_per_slot);
       auto const rdma_send_x_vec_row =
           reinterpret_cast<uint8_t*>(rdma_send_type_row);
+#endif
 
       auto const src_idx =
           __shfl_sync(WARP_MASK, __ldg(local_src_info + token_idx), 0);
+#ifndef LANE_E_COMBINE_DIRECT_SEND
       auto const buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
+#endif
       auto const dst_ptr =
           reinterpret_cast<uint64_t>(rdma_recv_x) +
           (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) *
@@ -1330,6 +1336,11 @@ __global__ __launch_bounds__(1024, 1) void combine(
                                       dst_rank, max_nvl_peers, 0)
               : 0;
 
+#ifdef LANE_E_COMBINE_DIRECT_SEND
+      if (dst_p2p_ptr != 0) {
+        auto const cpy_src_int4_ptr = x_int4;
+        auto const cpy_dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
+#else
       if (not zero_copy or dst_p2p_ptr != 0) {
         // Read from `cpy_src_int4_ptr` and copy into `cpy_dst_int4_ptr`
         auto const cpy_src_int4_ptr =
@@ -1337,6 +1348,7 @@ __global__ __launch_bounds__(1024, 1) void combine(
         auto const cpy_dst_int4_ptr =
             dst_p2p_ptr == 0 ? reinterpret_cast<int4*>(buf_ptr)
                              : reinterpret_cast<int4*>(dst_p2p_ptr);
+#endif
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         // TODO:  Simulated cast
@@ -1480,7 +1492,11 @@ __global__ __launch_bounds__(1024, 1) void combine(
           reinterpret_cast<int*>(cstage_u8)[1] = static_cast<int>(src_idx);
         }
         auto* cdst_int4 = reinterpret_cast<int4*>(cstage_u8 + sizeof(int4));
+#ifdef LANE_E_COMBINE_DIRECT_SEND
+        auto const* csrc_int4 = x_int4;
+#else
         auto const* csrc_int4 = reinterpret_cast<int4 const*>(buf_ptr);
+#endif
         UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, cdst_int4, csrc_int4,
                            ld_nc_global, st_na_global);
 #else

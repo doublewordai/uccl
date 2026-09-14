@@ -25,6 +25,7 @@ def main():
     p.add_argument("--replays", type=int, default=24)
     p.add_argument("--unbarriered", action="store_true")
     p.add_argument("--recv-hook", action="store_true")
+    p.add_argument("--zero-copy", action="store_true")
     a = p.parse_args()
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -125,12 +126,15 @@ def main():
         else:
             decoded = rx.float()
         supplied = (decoded * factors).to(torch.bfloat16)
+        if a.zero_copy:
+            buffer.get_next_low_latency_combine_buffer(handle).copy_(supplied)
         y, event, hook = buffer.low_latency_combine(
             supplied,
             ii,
             ww,
             handle,
             use_logfmt=False,
+            zero_copy=a.zero_copy,
             async_finish=not a.recv_hook,
             return_recv_hook=a.recv_hook,
         )

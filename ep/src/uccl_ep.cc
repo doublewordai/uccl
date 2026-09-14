@@ -1442,6 +1442,10 @@ class Buffer {
       int num_sms = 0, std::uintptr_t src_signals_ptr = 0,
       int src_signal_expect_value = 0) {
     EP_HOST_ASSERT(low_latency_mode);
+#ifdef LANE_E_COMBINE_DIRECT_SEND
+    EP_HOST_ASSERT(!use_logfmt && !zero_copy &&
+                   "direct combine send requires BF16 input outside the RDMA send arena");
+#endif
     EP_HOST_ASSERT(topk_rows == 0 ||
                    (x_ptr != 0 && topk_idx_ptr != 0 && topk_weights_ptr != 0));
     EP_HOST_ASSERT(topk_rows == 0 ||

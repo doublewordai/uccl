@@ -160,6 +160,18 @@ ifeq ($(LANE_E_COMBINE_COALESCE),1)
   override NVCCFLAGS += -DLANE_E_COMBINE_COALESCE
 endif
 
+# Pack coalesced BF16 combine messages directly from the supplied expert output.
+# This removes the redundant full per-expert send arena. Native zero-copy and
+# LogFMT inputs are rejected because they require that arena or its transform.
+LANE_E_COMBINE_DIRECT_SEND ?= 0
+ifeq ($(LANE_E_COMBINE_DIRECT_SEND),1)
+  ifneq ($(LANE_E_COMBINE_COALESCE),1)
+    $(error LANE_E_COMBINE_DIRECT_SEND requires LANE_E_COMBINE_COALESCE=1)
+  endif
+  override CXXFLAGS += -DLANE_E_COMBINE_DIRECT_SEND
+  override NVCCFLAGS += -DLANE_E_COMBINE_DIRECT_SEND
+endif
+
 ifdef NUM_MAX_NVL_PEERS
   override CXXFLAGS += -DNUM_MAX_NVL_PEERS=$(NUM_MAX_NVL_PEERS)
   override NVCCFLAGS += -DNUM_MAX_NVL_PEERS=$(NUM_MAX_NVL_PEERS)

@@ -275,9 +275,15 @@ struct LowLatencyLayout {
     size_t dispatch_send_buffer_bytes =
         num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
 #endif
+#ifdef LANE_E_COMBINE_DIRECT_SEND
+    // Local routes copy x directly through IPC; remote routes pack x into the
+    // separate coalesced send stage. Neither uses the old per-expert arena.
+    size_t combine_send_buffer_bytes = 0;
+#else
     size_t combine_send_buffer_bytes = num_experts *
                                        num_max_dispatch_tokens_per_rank *
                                        num_bytes_per_combine_msg;
+#endif
     size_t send_buffer_bytes =
         std::max(dispatch_send_buffer_bytes, combine_send_buffer_bytes);
     EP_HOST_ASSERT(send_buffer_bytes % sizeof(int4) == 0);
