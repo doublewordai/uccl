@@ -1,0 +1,48 @@
+{
+  "model": "dsv4-pro",
+  "world": 16,
+  "tokens_per_rank": 2048,
+  "old_combine_send_bytes_per_buffer": 11274289152,
+  "new_shared_send_bytes_per_buffer": 3791683584,
+  "rdma_bytes_saved": 14965211136,
+  "rdma_gib_saved": 13.93743896484375,
+  "method": "Static LowLatencyLayout difference: only the shared send arena shrinks; both ping-pong buffers included.",
+  "failed_run": 7302,
+  "failed_allocation_bytes": 11274289152,
+  "first_allocator_free_bytes": 10401677312,
+  "final_exception": "torch.OutOfMemoryError allocating packed_recv_x at ep/bench/buffer.py:358; 10.50 GiB requested with 2.04 GiB free after allocator retry",
+  "failed_log_sha256": "747bd05d0c6fbff4b2b4ca9348178fa5d5651cdc033e92dd94f192a1a260b444",
+  "completed_run": 7320,
+  "completed_p50_us": 23433.125,
+  "completed_max_ref_rel_l2": 0.0038807415403425694,
+  "completed_result_sha256": "fe912adf20808dfd60fbb94fb2e2b40e7d3bad9835b2307b9bcadec40616c1f2",
+  "completed_sources": {
+    "quantize": {
+      "path": "/projects/s6p/fergus.s6p/envs/vllm-0.28.0/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py",
+      "sha256": "ba29e79fa8ef4060b49111257550643223dbc8047ccde09ca66cb601d279bd90"
+    },
+    "weights_helper_sha256": "0f4194d5a308ae2e24ccbb8a1930174cc3e3806cf3026c687cbd103e8dd94597",
+    "buffer": {
+      "path": "/scratch/s6p/fergus.s6p/src/ep-moe-optimization-20260913/uccl-combine-direct-send/ep/bench/buffer.py",
+      "sha256": "0e80560b0c13b228cd95230ff84971a891db9f7ab9bd567498ea5240682e5a65"
+    },
+    "uccl_extension": {
+      "path": "/scratch/s6p/fergus.s6p/src/ep-moe-optimization-20260913/uccl-combine-direct-send/uccl/ep.abi3.so",
+      "sha256": "de7e0999de781b6c651474633abec4887bbd917101ef463143d718b56075e24e"
+    },
+    "expected_tokens_per_expert": 512.0,
+    "expert_compute": {
+      "path": "/scratch/s6p/fergus.s6p/runs/ep-moe-optimization-20260913/marlin-combined-fork.py",
+      "sha256": "da16d4fe1497ef85bc7e844148db7124a4d72dbe198c8f2dfe39221f0b5b1ee1"
+    },
+    "masked_activation": {
+      "path": "/scratch/s6p/fergus.s6p/runs/ep-moe-optimization-20260913/masked-activation-fork.py",
+      "sha256": "0a9e4c66a0dbf798b2ad74e6c478d32af8d03f967c77fb49c954954f157c6f0d"
+    },
+    "reference": {
+      "path": "/scratch/s6p/fergus.s6p/runs/ep-moe-optimization-20260913/moe-reference/dsv4-pro-t2048-rank00-22ca738665da3fbd.pt",
+      "key": "22ca738665da3fbd",
+      "full_output": true
+    }
+  }
+}

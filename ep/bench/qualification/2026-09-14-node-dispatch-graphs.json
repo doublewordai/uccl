@@ -1,0 +1,69 @@
+{
+  "date": "2026-09-14",
+  "compiler": "GCC 13.2, CUDA 13.0.88",
+  "integration_candidate": "083764be",
+  "tests": [
+    {
+      "variant": "integration-node-enabled",
+      "world": 8,
+      "arguments": "--tokens 128 --hidden 7168 --experts 512 --topk 8 --duplicates --unbarriered --recv-hook",
+      "test_sha256": "be19f341cca6e0251e837d50b27351a702219ac2dd800f053ce6d9f03a206c37",
+      "extension_sha256": "85f257de4e13e102488a779a831e983a8d8a1a13a64cd106aea8e4614152fa3e",
+      "log_sha256": "01cc419c9d2b66cd16d63945041e539f07d2b546d2dfbc483e1eb65ea6fd2694",
+      "result": "PASS 10 eager calls + 96 captured calls + true empty/ragged inputs + changing precision/capacity, exact routing metadata, max global relL2 0.025361",
+      "test_commit": "fc279d1f"
+    },
+    {
+      "variant": "integration-default-off",
+      "world": 8,
+      "arguments": "--tokens 128 --hidden 7168 --experts 512 --topk 8 --duplicates --unbarriered --recv-hook",
+      "test_sha256": "be19f341cca6e0251e837d50b27351a702219ac2dd800f053ce6d9f03a206c37",
+      "extension_sha256": "85233fa561cfa5f6794a9b845bf4bbef8bc4e8fe93a7ad6ed4f13ea61f8c2485",
+      "log_sha256": "deb8624db737a0872dd71105ed83751d3d85e498b706753acaf571ae5bb834da",
+      "result": "PASS 10 eager calls + 96 captured calls + true empty/ragged inputs + changing precision/capacity, exact routing metadata, max global relL2 0.025361",
+      "test_commit": "fc279d1f"
+    },
+    {
+      "variant": "integration-node-enabled",
+      "world": 16,
+      "arguments": "--tokens 128 --hidden 7168 --experts 1024 --topk 8 --duplicates --unbarriered --recv-hook",
+      "test_sha256": "be19f341cca6e0251e837d50b27351a702219ac2dd800f053ce6d9f03a206c37",
+      "extension_sha256": "85f257de4e13e102488a779a831e983a8d8a1a13a64cd106aea8e4614152fa3e",
+      "log_sha256": "f04b858e034ae9169ce049ad67cfbf384fcce82faff5cc1c78bcbb5ed1ec083e",
+      "result": "PASS 10 eager calls + 96 captured calls + true empty/ragged inputs + changing precision/capacity, exact routing metadata, max global relL2 0.024690",
+      "test_commit": "fc279d1f"
+    },
+    {
+      "variant": "integration-node-direct-send",
+      "test_commit": "c51fde2b",
+      "world": 16,
+      "arguments": "--tokens 128 --hidden 7168 --experts 1024 --topk 8 --duplicates --unbarriered --recv-hook --zero-copy",
+      "test_sha256": "689e46cfd8ef344e7f68c282bca41300ef0eda79e0de61b50c191b7f9c9d1eb3",
+      "extension_sha256": "de7e0999de781b6c651474633abec4887bbd917101ef463143d718b56075e24e",
+      "log_sha256": "4727d111b3aa192bea6d39adb89493641ec8aa9029739ac025e5901cd5b0710b",
+      "result": "PASS 10 eager calls + 96 captured calls + true empty/ragged inputs + changing precision/capacity, exact routing metadata, max global relL2 0.024690"
+    },
+    {
+      "variant": "standalone-node-direct-enabled",
+      "test_commit": "0295895d",
+      "world": 16,
+      "arguments": "--tokens 128 --hidden 7168 --experts 1024 --topk 8 --duplicates --unbarriered --recv-hook --zero-copy",
+      "test_sha256": "689e46cfd8ef344e7f68c282bca41300ef0eda79e0de61b50c191b7f9c9d1eb3",
+      "extension_sha256": "f1bee17b80e2a77da7feb4a87fb7380efecfa81660392fe5df9a78ff53762bbb",
+      "log_sha256": "4f14d51c67b02d769de956da16dbdb6c7b4547b47bfe94cfec1852a2d164f2dd",
+      "result": "PASS 10 eager calls + 96 captured calls + true empty/ragged inputs + changing precision/capacity, exact routing metadata, max global relL2 0.024690",
+      "compiler_override": "Makefile overlay selects g++ from gcc-native/13.2 and substitutes the hardcoded NVCC ccbin; no source edits"
+    },
+    {
+      "variant": "standalone-default-off",
+      "test_commit": "0295895d",
+      "world": 8,
+      "arguments": "--tokens 128 --hidden 7168 --experts 512 --topk 8 --duplicates --unbarriered --recv-hook --zero-copy",
+      "test_sha256": "689e46cfd8ef344e7f68c282bca41300ef0eda79e0de61b50c191b7f9c9d1eb3",
+      "extension_sha256": "970e76abb245f22c84ec75860d5427cefbf6d6477a4d4396aa524780e5e53d68",
+      "log_sha256": "c96533b4c76e2fb3fb2ada46ef055c85ebac1db8010c4b45825c7e3b24bfa0eb",
+      "result": "PASS 10 eager calls + 96 captured calls + true empty/ragged inputs + changing precision/capacity, exact routing metadata, max global relL2 0.025361",
+      "compiler_override": "Makefile overlay selects g++ from gcc-native/13.2 and substitutes the hardcoded NVCC ccbin; no source edits"
+    }
+  ]
+}
