@@ -1,5 +1,6 @@
 #pragma once
 
+#include "compact_ipc.hpp"
 #include <cstddef>
 #include <cstdint>  // int64_t
 #include <vector>
@@ -8,6 +9,14 @@
 
 namespace uccl {
 namespace internode_ll {
+void compact_dispatch(uccl::CompactIPCLayout workspace, void const* x,
+                      int64_t const* ids, float const* weights, void* output_q,
+                      float* output_scales, int64_t* output_ids, float* output_weights,
+                      int tokens, int capacity, int hidden, int topk, int experts,
+                      int rank, int ranks, int peers, void** ipc, cudaStream_t stream);
+void compact_combine(uccl::CompactIPCLayout workspace, void* output,
+                     int tokens, int capacity, int hidden, int rank, int ranks,
+                     int peers, void** ipc, cudaStream_t stream);
 void clean_low_latency_buffer(int* clean_0, int num_clean_int_0, int* clean_1,
                               int num_clean_int_1, int** barrier_signal_ptrs,
                               int rank, int num_ranks, cudaStream_t stream);
@@ -28,7 +37,13 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               void** ipc_rdma_base_ptrs = nullptr,
               void* rdma_buffer_ptr = nullptr,
               void* atomic_buffer_ptr = nullptr,
-              int64_t* rdma_recv_count_internode = nullptr);
+              int64_t* rdma_recv_count_internode = nullptr,
+              // Lane E dest-rank coalescing staging (unused unless
+              // LANE_E_DESTRANK_COALESCE is compiled in).
+              void* rdma_x_stage = nullptr, void* recv_stage = nullptr,
+              int64_t* stage_flag_internode = nullptr,
+              void** ipc_nvl_base_ptrs = nullptr,
+              size_t node_control_offset = 0);
 
 void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              void* rdma_send_x, void const* x, int64_t const* topk_idx,
@@ -43,6 +58,11 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              int num_d2h_channel_addrs, int max_nvl_peers,
              int low_latency_buffer_idx, void** ipc_rdma_base_ptrs = nullptr,
              void* rdma_buffer_ptr = nullptr, void* atomic_buffer_ptr = nullptr,
-             int64_t* rdma_recv_flag_internode = nullptr);
+             int64_t* rdma_recv_flag_internode = nullptr,
+             // Lane E combine-side coalescing staging (unused unless
+             // LANE_E_COMBINE_COALESCE is compiled in).
+             void* combine_send_stage = nullptr,
+             void* combine_recv_stage = nullptr,
+             int64_t* combine_stage_flag_internode = nullptr);
 }  // namespace internode_ll
 }  // namespace uccl

@@ -1264,14 +1264,69 @@ class Buffer {
     return event;
   }
 
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+  std::size_t compact_configure(int capacity, int hidden, int topk,
+                                int experts, std::uintptr_t stream_ptr,
+                                std::size_t workspace_offset = 0) {
+    EP_HOST_ASSERT(low_latency_mode && compact_capacity == 0);
+    EP_HOST_ASSERT(workspace_offset % 256 == 0);
+    EP_HOST_ASSERT(workspace_offset <= static_cast<std::size_t>(num_rdma_bytes));
+    EP_HOST_ASSERT(num_ranks <= max_nvl_peers && num_ranks <= 4);
+    EP_HOST_ASSERT(d_ipc_rdma_base_ptrs != nullptr);
+    EP_HOST_ASSERT(capacity > 0 && capacity <= 32 && hidden > 0 && hidden % 256 == 0);
+    EP_HOST_ASSERT(topk > 0 && topk <= 8 && experts > 0);
+    auto* workspace = static_cast<uint8_t*>(rdma_buffer_ptr) + workspace_offset;
+    uccl::CompactIPCLayout layout(workspace, capacity, hidden, topk, num_ranks);
+    EP_HOST_ASSERT(layout.bytes <= static_cast<std::size_t>(num_rdma_bytes) - workspace_offset);
+    cudaPointerAttributes attributes;
+    CUDA_CHECK(cudaPointerGetAttributes(&attributes, rdma_buffer_ptr));
+    EP_HOST_ASSERT(attributes.type == cudaMemoryTypeDevice);
+    compact_capacity = capacity; compact_hidden = hidden;
+    compact_topk = topk; compact_experts = experts;
+    compact_workspace_offset = workspace_offset;
+    CUDA_CHECK(cudaMemsetAsync(workspace, 0, 256, reinterpret_cast<cudaStream_t>(stream_ptr)));
+    return workspace_offset + layout.partial_offset;
+  }
+
+  void compact_dispatch(std::uintptr_t x, std::uintptr_t ids,
+                        std::uintptr_t weights, int tokens,
+                        std::uintptr_t output_q, std::uintptr_t output_scales,
+                        std::uintptr_t output_ids, std::uintptr_t output_weights,
+                        std::uintptr_t stream_ptr) {
+    EP_HOST_ASSERT(compact_capacity > 0 && tokens >= 0 && tokens <= compact_capacity);
+    EP_HOST_ASSERT(tokens == 0 || (x && ids && weights));
+    EP_HOST_ASSERT(output_q && output_scales && output_ids && output_weights);
+    uccl::CompactIPCLayout layout(static_cast<uint8_t*>(rdma_buffer_ptr) + compact_workspace_offset, compact_capacity, compact_hidden, compact_topk, num_ranks);
+    uccl::internode_ll::compact_dispatch(layout, reinterpret_cast<void const*>(x),
+      reinterpret_cast<int64_t const*>(ids), reinterpret_cast<float const*>(weights),
+      reinterpret_cast<void*>(output_q), reinterpret_cast<float*>(output_scales),
+      reinterpret_cast<int64_t*>(output_ids), reinterpret_cast<float*>(output_weights),
+      tokens, compact_capacity, compact_hidden, compact_topk, compact_experts,
+      rank, num_ranks, max_nvl_peers, d_ipc_rdma_base_ptrs, reinterpret_cast<cudaStream_t>(stream_ptr));
+  }
+
+  void compact_combine(std::uintptr_t output, int tokens, std::uintptr_t stream_ptr) {
+    EP_HOST_ASSERT(compact_capacity > 0 && tokens >= 0 && tokens <= compact_capacity);
+    EP_HOST_ASSERT(tokens == 0 || output);
+    uccl::CompactIPCLayout layout(static_cast<uint8_t*>(rdma_buffer_ptr) + compact_workspace_offset, compact_capacity, compact_hidden, compact_topk, num_ranks);
+    uccl::internode_ll::compact_combine(layout, reinterpret_cast<void*>(output),
+      tokens, compact_capacity, compact_hidden, rank, num_ranks, max_nvl_peers,
+      d_ipc_rdma_base_ptrs, reinterpret_cast<cudaStream_t>(stream_ptr));
+  }
+
+#endif
+
   void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank,
                                 int hidden, int num_experts,
                                 std::uintptr_t stream_ptr) {
-    EP_HOST_ASSERT(low_latency_mode);
+    EP_HOST_ASSERT(low_latency_mode && (compact_capacity == 0 || compact_workspace_offset > 0));
 
     auto layout = uccl::LowLatencyLayout(rdma_buffer_ptr,
                                          num_max_dispatch_tokens_per_rank,
                                          hidden, num_ranks, num_experts);
+    EP_HOST_ASSERT(layout.total_bytes <= (compact_capacity > 0
+                       ? compact_workspace_offset
+                       : static_cast<std::size_t>(num_rdma_bytes)));
     auto clean_meta_0 = layout.buffers[0].clean_meta();
     auto clean_meta_1 = layout.buffers[1].clean_meta();
     auto [ptr0, ptr_internode0, count0] = clean_meta_0;
@@ -1309,7 +1364,7 @@ class Buffer {
                        int num_max_dispatch_tokens_per_rank, int num_experts,
                        bool use_fp8, bool round_scale, bool use_ue8m0,
                        bool async, bool return_recv_hook) {
-    EP_HOST_ASSERT(low_latency_mode);
+    EP_HOST_ASSERT(low_latency_mode && (compact_capacity == 0 || compact_workspace_offset > 0));
     EP_HOST_ASSERT(x_rows == 0 || (x_ptr != 0 && topk_idx_ptr != 0));
     EP_HOST_ASSERT(packed_recv_x_ptr != 0 && packed_recv_count_ptr != 0);
     EP_HOST_ASSERT(packed_recv_src_info_ptr != 0 &&
@@ -1334,8 +1389,9 @@ class Buffer {
     uccl::LowLatencyLayout layout(rdma_buffer_ptr,
                                   num_max_dispatch_tokens_per_rank, hidden,
                                   num_ranks, num_experts, atomic_buffer_ptr);
-    EP_HOST_ASSERT(layout.total_bytes <=
-                   static_cast<std::size_t>(num_rdma_bytes));
+    EP_HOST_ASSERT(layout.total_bytes <= (compact_capacity > 0
+                       ? compact_workspace_offset
+                       : static_cast<std::size_t>(num_rdma_bytes)));
     int low_latency_buffer_idx_used = low_latency_buffer_idx;
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
@@ -1420,7 +1476,7 @@ class Buffer {
       std::uintptr_t comp_signal_ptr = 0, int block_m = 64, int threshold = 0,
       int num_sms = 0, std::uintptr_t src_signals_ptr = 0,
       int src_signal_expect_value = 0) {
-    EP_HOST_ASSERT(low_latency_mode);
+    EP_HOST_ASSERT(low_latency_mode && (compact_capacity == 0 || compact_workspace_offset > 0));
     EP_HOST_ASSERT(topk_rows == 0 ||
                    (x_ptr != 0 && topk_idx_ptr != 0 && topk_weights_ptr != 0));
     EP_HOST_ASSERT(topk_rows == 0 ||
@@ -1461,8 +1517,9 @@ class Buffer {
     uccl::LowLatencyLayout layout(rdma_buffer_ptr,
                                   num_max_dispatch_tokens_per_rank, hidden,
                                   num_ranks, num_experts, atomic_buffer_ptr);
-    EP_HOST_ASSERT(layout.total_bytes <=
-                   static_cast<std::size_t>(num_rdma_bytes));
+    EP_HOST_ASSERT(layout.total_bytes <= (compact_capacity > 0
+                       ? compact_workspace_offset
+                       : static_cast<std::size_t>(num_rdma_bytes)));
     int low_latency_buffer_idx_used = low_latency_buffer_idx;
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
@@ -1734,6 +1791,8 @@ class Buffer {
   bool available{false};
   void* rdma_buffer_ptr = nullptr;
   void* atomic_buffer_ptr = nullptr;
+  std::size_t compact_workspace_offset = 0;
+  int compact_capacity = 0, compact_hidden = 0, compact_topk = 0, compact_experts = 0;
   int low_latency_buffer_idx = 0;
   void* workspace = nullptr;
 
@@ -2327,6 +2386,14 @@ NB_MODULE(ep, m) {
           nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
           nb::arg("allocate_on_comm_stream") = false,
           nb::arg("compute_stream_ptr") = 0)
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+      .def("compact_configure", &Buffer::compact_configure,
+           nb::arg("capacity"), nb::arg("hidden"), nb::arg("topk"),
+           nb::arg("experts"), nb::arg("stream_ptr"),
+           nb::arg("workspace_offset") = 0)
+      .def("compact_dispatch", &Buffer::compact_dispatch)
+      .def("compact_combine", &Buffer::compact_combine)
+#endif
       .def("clean_low_latency_buffer", &Buffer::clean_low_latency_buffer,
            nb::arg("num_max_dispatch_tokens_per_rank"), nb::arg("hidden"),
            nb::arg("num_experts"), nb::arg("stream_ptr"))
