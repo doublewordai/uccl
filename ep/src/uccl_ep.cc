@@ -1341,9 +1341,11 @@ class Buffer {
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
 
     auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    // A synchronous operation has no overlap to preserve. Keep it on the
+    // caller's stream instead of recording two stream handoffs.
+    auto launch_stream = async ? comm_stream : compute_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+    if (launch_stream != compute_stream) stream_wait(launch_stream, compute_stream);
 
     void* x = reinterpret_cast<void*>(x_ptr);
     int64_t* topk_idx = reinterpret_cast<int64_t*>(topk_idx_ptr);
@@ -1389,8 +1391,6 @@ class Buffer {
     std::optional<EventHandle> event;
     if (async) {
       event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-      stream_wait(compute_stream, launch_stream);
     }
 
     std::optional<std::function<void()>> recv_hook = std::nullopt;
@@ -1468,9 +1468,11 @@ class Buffer {
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
 
     auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    // A synchronous operation has no overlap to preserve. Keep it on the
+    // caller's stream instead of recording two stream handoffs.
+    auto launch_stream = async ? comm_stream : compute_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+    if (launch_stream != compute_stream) stream_wait(launch_stream, compute_stream);
 
     void* x = reinterpret_cast<void*>(x_ptr);
     int64_t* topk_idx = reinterpret_cast<int64_t*>(topk_idx_ptr);
@@ -1504,8 +1506,6 @@ class Buffer {
     std::optional<EventHandle> event;
     if (async) {
       event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-      stream_wait(compute_stream, launch_stream);
     }
 
     std::optional<std::function<void()>> recv_hook = std::nullopt;
