@@ -263,3 +263,10 @@ ifeq ($(LANE_E_COMBINE_INDIRECT),1)
   endif
   override NVCCFLAGS += -DLANE_E_COMBINE_INDIRECT
 endif
+
+# Use correctly rounded FP8 division and the per-token quantizer's amax floor.
+UCCL_FP8_EXACT_QUANT ?= 0
+ifeq ($(UCCL_FP8_EXACT_QUANT),1)
+  override NVCCFLAGS += -DUCCL_FP8_EXACT_QUANT
+
+endif
