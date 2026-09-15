@@ -1,7 +1,8 @@
 """One-node compact IPC path for small FP8 routed expert batches.
 
-Use a fresh Buffer exclusively for this protocol. Dispatch and combine must
-alternate on the current CUDA stream; no host route or handle is cached.
+Dispatch and combine alternate on the current CUDA stream. A supplied Buffer
+can retain normal LL service when compact memory occupies a disjoint suffix;
+its caller must reserve that suffix beyond the normal LL size hint.
 Expert computation writes BF16 local weighted partials into ``partial``.
 """
 
@@ -12,7 +13,17 @@ from .buffer import Buffer
 
 
 class CompactIPC:
-    def __init__(self, group, capacity, hidden, topk, experts):
+    def __init__(
+        self,
+        group,
+        capacity,
+        hidden,
+        topk,
+        experts,
+        *,
+        buffer: Buffer | None = None,
+        workspace_offset: int = 0,
+    ):
         self.world = dist.get_world_size(group)
         self.capacity, self.hidden, self.topk = capacity, hidden, topk
         if not (1 <= self.world <= 4 and 1 <= capacity <= 32 and 1 <= topk <= 8):
@@ -21,30 +32,62 @@ class CompactIPC:
             )
         if hidden not in (2048, 2560, 4096, 5120, 6144, 7168, 8192) or experts <= 0:
             raise ValueError("Unsupported compact IPC hidden size or expert count")
-        geometry = (socket.gethostname(), capacity, hidden, topk, experts)
+        if workspace_offset < 0 or workspace_offset % 256:
+            raise ValueError(
+                "Compact workspace offset must be nonnegative and 256-byte aligned"
+            )
+        if buffer is not None and (
+            workspace_offset == 0
+            or buffer.group is not group
+            or not buffer.low_latency_mode
+        ):
+            raise ValueError(
+                "A shared LL buffer requires a positive suffix offset and the same group"
+            )
+        if buffer is None and workspace_offset != 0:
+            raise ValueError("A standalone compact buffer uses offset zero")
+        geometry = (
+            socket.gethostname(),
+            capacity,
+            hidden,
+            topk,
+            experts,
+            workspace_offset,
+        )
         peers = [None] * self.world
         dist.all_gather_object(peers, geometry, group=group)
         if not all(peer == geometry for peer in peers):
             raise ValueError(
                 f"Compact IPC requires matching geometry on one host: {peers}"
             )
-        self.transport = Buffer(
-            group,
-            num_nvl_bytes=Buffer.get_dispatch_config(
-                self.world
-            ).get_nvl_buffer_size_hint(hidden * 2, self.world),
-            num_rdma_bytes=32 * 1024 * 1024,
-            low_latency_mode=True,
-            num_qps_per_rank=1,
-            allow_nvlink_for_low_latency_mode=True,
-            explicitly_destroy=True,
-            is_intranode=True,
+        self._owns_transport = buffer is None
+        self.transport = (
+            buffer
+            if buffer is not None
+            else Buffer(
+                group,
+                num_nvl_bytes=Buffer.get_dispatch_config(
+                    self.world
+                ).get_nvl_buffer_size_hint(hidden * 2, self.world),
+                num_rdma_bytes=32 * 1024 * 1024,
+                low_latency_mode=True,
+                num_qps_per_rank=1,
+                allow_nvlink_for_low_latency_mode=True,
+                explicitly_destroy=True,
+                is_intranode=True,
+            )
         )
         if self.transport.scratch.device.type != "cuda":
-            self.transport.destroy()
+            if self._owns_transport:
+                self.transport.destroy()
             raise RuntimeError("Compact IPC requires device-resident transport memory")
         offset = self.transport.runtime.compact_configure(
-            capacity, hidden, topk, experts, torch.cuda.current_stream().cuda_stream
+            capacity,
+            hidden,
+            topk,
+            experts,
+            torch.cuda.current_stream().cuda_stream,
+            workspace_offset,
         )
         self.partial = (
             self.transport.scratch.narrow(0, offset, self.world * capacity * hidden * 2)
@@ -117,4 +160,5 @@ class CompactIPC:
         return out
 
     def destroy(self):
-        self.transport.destroy()
+        if self._owns_transport:
+            self.transport.destroy()
