@@ -1,5 +1,6 @@
 #pragma once
 
+#include "compact_ipc.hpp"
 #include <cstddef>
 #include <cstdint>  // int64_t
 #include <vector>
@@ -8,6 +9,14 @@
 
 namespace uccl {
 namespace internode_ll {
+void compact_dispatch(uccl::CompactIPCLayout workspace, void const* x,
+                      int64_t const* ids, float const* weights, void* output_q,
+                      float* output_scales, int64_t* output_ids, float* output_weights,
+                      int tokens, int capacity, int hidden, int topk, int experts,
+                      int rank, int ranks, int peers, void** ipc, cudaStream_t stream);
+void compact_combine(uccl::CompactIPCLayout workspace, void* output,
+                     int tokens, int capacity, int hidden, int rank, int ranks,
+                     int peers, void** ipc, cudaStream_t stream);
 void clean_low_latency_buffer(int* clean_0, int num_clean_int_0, int* clean_1,
                               int num_clean_int_1, int** barrier_signal_ptrs,
                               int rank, int num_ranks, cudaStream_t stream);
