@@ -5,6 +5,7 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 from uccl.ep_api.compact import CompactIPC
+from uccl.ep_api import Buffer
 
 
 def per_token_group_quant_fp8(x, group_size, use_ue8m0=False):
@@ -27,8 +28,57 @@ torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 torch.set_num_threads(4)
 dist.init_process_group("gloo", timeout=timedelta(seconds=120))
 H, K, E, C = 7168, 6, 384, 32
-transport = CompactIPC(dist.group.WORLD, C, H, K, E)
+shared = os.environ.get("UCCL_TEST_COMPACT_SHARED_LL") == "1"
+ll_buffer = None
+if shared:
+    ll_bytes = Buffer.get_low_latency_rdma_size_hint(C, H, world, E)
+    offset = (ll_bytes + 255) // 256 * 256
+    ll_buffer = Buffer(
+        dist.group.WORLD,
+        Buffer.get_dispatch_config(world).get_nvl_buffer_size_hint(H * 2, world),
+        offset + 32 * 1024 * 1024,
+        low_latency_mode=True,
+        num_qps_per_rank=E // world,
+        explicitly_destroy=True,
+        is_intranode=True,
+    )
+    transport = CompactIPC(
+        dist.group.WORLD, C, H, K, E, buffer=ll_buffer, workspace_offset=offset
+    )
+else:
+    transport = CompactIPC(dist.group.WORLD, C, H, K, E)
 device = transport.partial.device
+
+
+def check_ll():
+    if ll_buffer is None:
+        return
+    values = torch.full((3, H), rank + 1, dtype=torch.bfloat16, device=device)
+    routes = torch.arange(K, device=device, dtype=torch.int64).expand(3, K).contiguous()
+    route_weights = torch.ones(3, K, device=device)
+    received, counts, handle, _, _ = ll_buffer.low_latency_dispatch(
+        values,
+        routes,
+        C,
+        E,
+        use_fp8=False,
+        async_finish=False,
+        return_recv_hook=False,
+    )
+    output, _, _ = ll_buffer.low_latency_combine(
+        received,
+        routes,
+        route_weights,
+        handle,
+        async_finish=False,
+        return_recv_hook=False,
+    )
+    torch.testing.assert_close(
+        output, torch.full_like(values, (rank + 1) * K), rtol=0, atol=0
+    )
+
+
+check_ll()
 graphs = []
 for pattern in range(4):
     sizes = (
@@ -116,6 +166,8 @@ for pattern in range(4):
     graphs.append((graph, x, ids, weights, out, cases, held1, held2))
 
 for replay in range(128):
+    if replay % 16 == 0:
+        check_ll()
     for index, (graph, x, ids, weights, out, cases, held1, held2) in enumerate(graphs):
         case = cases[(replay + index) % len(cases)]
         x.copy_(case[0])
@@ -156,4 +208,6 @@ if rank == 0:
         flush=True,
     )
 transport.destroy()
+if ll_buffer is not None:
+    ll_buffer.destroy()
 dist.destroy_process_group()
