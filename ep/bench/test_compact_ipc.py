@@ -10,8 +10,14 @@ from uccl.ep_api.compact import CompactIPC
 def per_token_group_quant_fp8(x, group_size, use_ue8m0=False):
     # Independent eager reference: FP32 amax and division, then FP8 rounding.
     values = x.float().reshape(x.shape[0], x.shape[1] // group_size, group_size)
-    scales = values.abs().amax(-1).clamp_min(1e-10) / 448.0
-    quantized = (values / scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    # Tensor/scalar FP32 division may be lowered to reciprocal multiplication.
+    # Evaluate in FP64, then round explicitly to FP32 for the wire contract.
+    scales = (values.abs().amax(-1).clamp_min(1e-10).double() / 448.0).float()
+    quantized = (
+        (values.double() / scales.double().unsqueeze(-1))
+        .float()
+        .to(torch.float8_e4m3fn)
+    )
     return quantized.reshape(x.shape), scales
 
 
@@ -119,6 +125,18 @@ for replay in range(128):
             time.sleep(rank * 0.0002)
         graph.replay()
         torch.cuda.synchronize()
+        if not torch.equal(transport.q.view(torch.uint8), case[3]):
+            mismatch = transport.q.view(torch.uint8) != case[3]
+            print(
+                "FP8_MISMATCH",
+                rank,
+                replay,
+                index,
+                mismatch.sum().item(),
+                "scale_max_diff",
+                (transport.scales - case[4]).abs().max().item(),
+                flush=True,
+            )
         assert torch.equal(transport.q.view(torch.uint8), case[3]), (
             "FP8 bytes",
             rank,
