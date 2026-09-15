@@ -232,7 +232,7 @@ $(EP_EXT): $(OBJ_CPP) $(OBJ_CU) $(OBJ_CC_LIB) $(OBJ_BIND) $(NB_OBJECTS)
 py: $(PYTARGET) $(EP_EXT)
 
 # Repo uccl package dir (so in-repo runs use the same build)
-UCCL_UCCL := $(abspath $(CURDIR)/../uccl/uccl)
+UCCL_UCCL := $(abspath $(CURDIR)/../uccl)
 
 install: $(EP_EXT)
 	@mkdir -p $(INSTALL_DIR)
