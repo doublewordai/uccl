@@ -1,15 +1,2 @@
-from uccl.ep import Config, EventHandle
-
-from .utils import EventOverlap, check_nvlink_connections, initialize_uccl, destroy_uccl
-from .buffer import Buffer
-import torch.distributed as dist
-
-__all__ = [
-    "Config",
-    "EventHandle",
-    "Buffer",
-    "EventOverlap",
-    "check_nvlink_connections",
-    "initialize_uccl",
-    "destroy_uccl",
-]
+"""Legacy DeepEP-compatible import; new callers should use uccl.ep_api."""
+from uccl.ep_api import *  # noqa: F401,F403
