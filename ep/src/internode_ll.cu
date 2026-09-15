@@ -652,6 +652,10 @@ LOW_LATENCY_DISPATCH_RECV:
   }
 }
 
+#if defined(__NVCC__)
+#include "compact_ipc.cuh"
+#endif
+
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
               int* packed_recv_count, int* cumulative_local_expert_recv_stats,
