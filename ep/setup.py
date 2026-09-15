@@ -429,6 +429,9 @@ if __name__ == "__main__":
         cxx_flags.append("-DDISABLE_AGGRESSIVE_PTX_INSTRS")
         nvcc_flags.append("-DDISABLE_AGGRESSIVE_PTX_INSTRS")
 
+    if int(os.getenv("UCCL_FP8_EXACT_QUANT", "0")):
+        nvcc_flags.append("-DUCCL_FP8_EXACT_QUANT")
+
     # Put them together
     extra_compile_args = {
         "cxx": cxx_flags,
