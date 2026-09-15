@@ -2017,7 +2017,9 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx,
 #endif
   int const num_warps = num_threads / WARP_SIZE;
   auto const num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-  int const kNumTMABytesPerWarp = 8192;
+  // Keep 32 notification warps within Hopper shared-memory limits.
+  // The existing loop handles batches larger than a single tile.
+  int const kNumTMABytesPerWarp = 4096;
   int const smem_size = kNumTMABytesPerWarp * num_warps;
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
