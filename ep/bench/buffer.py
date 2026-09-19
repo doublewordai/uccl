@@ -778,10 +778,16 @@ class Buffer:
         """
 
         # TODO: automatically tune
+        # Internode combine splits its 16 forwarder warps across the RDMA ranks
+        # and asserts num_max_rdma_chunked_send_tokens (4th field) >=
+        # 16 // num_rdma_ranks. Any layout that uses RDMA has at least two RDMA
+        # ranks, so 8 satisfies the check for every GPUs-per-node count. The
+        # 2/4/8-rank rows only reach RDMA on nodes with fewer than 8 GPUs; on
+        # 8-GPU nodes they are intranode and the field is unused.
         config_map = {
-            2: Config(Buffer.num_sms, 10, 256, 6, 128),
-            4: Config(Buffer.num_sms, 9, 256, 6, 128),
-            8: Config(Buffer.num_sms, 4, 256, 6, 128),
+            2: Config(Buffer.num_sms, 10, 256, 8, 128),
+            4: Config(Buffer.num_sms, 9, 256, 8, 128),
+            8: Config(Buffer.num_sms, 4, 256, 8, 128),
             16: Config(Buffer.num_sms, 4, 288, 12, 512 if Buffer._is_efa() else 128),
             24: Config(Buffer.num_sms, 1, 288, 8, 128),
             32: Config(Buffer.num_sms, 1, 288, 8, 512 if Buffer._is_efa() else 128),
