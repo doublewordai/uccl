@@ -191,9 +191,3 @@ clean:
 # Automatically include dependency files if they exist
 DEPS := $(OBJ_CPP:.o=.d) $(OBJ_CC:.o=.d) $(OBJ_CC_LIB:.o=.d) $(OBJ_CU:.o=.d) $(OBJ_BIND:.o=.d)
 -include $(DEPS)
-
-# Use correctly rounded FP8 division and the per-token quantizer's amax floor.
-UCCL_FP8_EXACT_QUANT ?= 0
-ifeq ($(UCCL_FP8_EXACT_QUANT),1)
-  override NVCCFLAGS += -DUCCL_FP8_EXACT_QUANT
-endif
