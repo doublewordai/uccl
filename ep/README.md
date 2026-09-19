@@ -59,8 +59,8 @@ Note:
 With `UCCL_EP_TRANSPORT=cxi`, proxy threads pin themselves to CPUs inside the
 calling task's affinity mask. Provide enough CPUs per rank for its proxy
 threads and the application. HT and LL proxies use separate CPU ordinals;
-ordinals wrap when the allowed CPU set is too small. Set
-`UCCL_EP_CXI_PIN_THREADS=0` to disable CXI proxy pinning.
+ordinals wrap when the allowed CPU set is too small. Pinning follows the
+proxy's existing `pin_thread` setting.
 
 ## Example APIs
 

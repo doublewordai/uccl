@@ -244,8 +244,7 @@ void Proxy::init_common() {
   ctx_.thread_idx = cfg_.thread_idx;
 
   if (use_cxi_transport()) {
-    const char* pin_env = std::getenv("UCCL_EP_CXI_PIN_THREADS");
-    if (cfg_.pin_thread && (!pin_env || std::string(pin_env) != "0")) {
+    if (cfg_.pin_thread) {
       cpu_set_t allowed;
       CPU_ZERO(&allowed);
       if (pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed))
