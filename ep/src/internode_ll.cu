@@ -227,8 +227,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
 #pragma unroll
           for (int j = 0; j < kNumElemsPerRead; j += 2) {
 #if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
-            float2 fp32x2 = {__fdiv_rn(fp32_values[j], scale_inv),
-                            __fdiv_rn(fp32_values[j + 1], scale_inv)};
+            // Rounded scales are powers of two, so the multiply is exact.
+            float2 fp32x2 =
+                round_scale
+                    ? float2{fp32_values[j] * scale, fp32_values[j + 1] * scale}
+                    : float2{__fdiv_rn(fp32_values[j], scale_inv),
+                             __fdiv_rn(fp32_values[j + 1], scale_inv)};
 #else
             float2 fp32x2 = {fp32_values[j] * scale,
                              fp32_values[j + 1] * scale};
