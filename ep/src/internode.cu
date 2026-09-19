@@ -1981,10 +1981,27 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx,
 #endif
   int const num_warps = num_threads / WARP_SIZE;
   auto const num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-  // Keep 32 notification warps within Hopper shared-memory limits.
-  // The existing loop handles batches larger than a single tile.
-  int const kNumTMABytesPerWarp = 4096;
-  int const smem_size = kNumTMABytesPerWarp * num_warps;
+  // Each warp stages through a shared-memory tile; the kernel loops over
+  // batches larger than one tile, so the tile size only has to fit the
+  // device's per-block shared-memory limit. Keep the 8 KiB tile wherever it
+  // fits and halve it otherwise (for example 32 warps on a device whose limit
+  // is below 256 KiB).
+  constexpr int kNumTMABytesPerWarp = 8192;
+  constexpr int kNumSmallTMABytesPerWarp = 4096;
+  bool use_small_tile = false;
+#if defined(__NVCC__) && !defined(DISABLE_SM90_FEATURES)
+  int device_id = 0, max_smem = 0;
+  if (cudaGetDevice(&device_id) == cudaSuccess &&
+      cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                             device_id) == cudaSuccess &&
+      max_smem > 0) {
+    use_small_tile = static_cast<int64_t>(kNumTMABytesPerWarp) * num_warps >
+                     static_cast<int64_t>(max_smem);
+  }
+#endif
+  int const smem_size =
+      (use_small_tile ? kNumSmallTMABytesPerWarp : kNumTMABytesPerWarp) *
+      num_warps;
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
   EP_HOST_ASSERT(num_warps * WARP_SIZE <= MAX_NTHREADS);
@@ -2015,9 +2032,12 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx,
   EP_HOST_ASSERT(num_channels * 2 > 3);
 
   // Launch kernel
-  auto cached_notify_func = low_latency_mode
-                                ? cached_notify<true, kNumTMABytesPerWarp>
-                                : cached_notify<false, kNumTMABytesPerWarp>;
+  auto cached_notify_func =
+      use_small_tile
+          ? (low_latency_mode ? cached_notify<true, kNumSmallTMABytesPerWarp>
+                              : cached_notify<false, kNumSmallTMABytesPerWarp>)
+          : (low_latency_mode ? cached_notify<true, kNumTMABytesPerWarp>
+                              : cached_notify<false, kNumTMABytesPerWarp>);
   SETUP_LAUNCH_CONFIG(num_channels * 2, num_threads, stream);
   SET_SHARED_MEMORY_FOR_TMA(cached_notify_func);
   LAUNCH_KERNEL(&cfg, cached_notify_func, rdma_clean_meta.first,
