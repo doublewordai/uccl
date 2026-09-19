@@ -89,6 +89,7 @@ def test_main(
     seed: int = 0,
     skip_benchmark: bool = False,
     debug_hash: bool = False,
+    skip_zero_copy: bool = False,
 ):
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
@@ -335,7 +336,7 @@ def test_main(
                                     include_in_overall=False,
                                 )
                             # Check combine correctness
-                            for zero_copy in (False,) if use_logfmt else (False, True):
+                            for zero_copy in (False,) if (use_logfmt or skip_zero_copy) else (False, True):
                                 if zero_copy:
                                     buffer.get_next_low_latency_combine_buffer(handle)[
                                         :, :, :
@@ -478,6 +479,10 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     buffer = Buffer(
         group,
+        # Coalesced low-latency builds keep per-node reader acknowledgements in the NVLink buffer.
+        num_nvl_bytes=Buffer.get_dispatch_config(num_ranks).get_nvl_buffer_size_hint(
+            hidden * 2, num_ranks
+        ),
         num_rdma_bytes=num_rdma_bytes,
         low_latency_mode=True,
         num_qps_per_rank=num_experts // num_ranks,
@@ -503,6 +508,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             dispatch_use_fp8=args.dispatch_use_fp8,
             seed=seed,
             skip_benchmark=args.pressure_test_mode == 1,
+            skip_zero_copy=args.skip_zero_copy,
             debug_hash=args.debug_hash,
         )
         if args.debug_hash:
@@ -531,7 +537,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 dispatch_use_fp8=args.dispatch_use_fp8,
                 seed=seed,
                 skip_benchmark=args.pressure_test_mode == 1,
-                debug_hash=args.debug_hash,
+                skip_zero_copy=args.skip_zero_copy,
+                            debug_hash=args.debug_hash,
             )
             if args.debug_hash:
                 current_hash, current_hash_details = cur_out
@@ -615,6 +622,11 @@ if __name__ == "__main__":
         default=True,
         action=argparse.BooleanOptionalAction,
         help="Whether dispatch path uses FP8 casting (default: true).",
+    )
+    parser.add_argument(
+        "--skip-zero-copy",
+        action="store_true",
+        help="Skip zero-copy combine (rejected by LL_COALESCE=1 builds)",
     )
     parser.add_argument(
         "--pressure-test-mode",
