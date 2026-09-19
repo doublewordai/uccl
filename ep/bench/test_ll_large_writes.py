@@ -40,6 +40,8 @@ def main():
     ids = (torch.arange(args.topk, device="cuda") + target * groups).expand(args.tokens, -1).contiguous()
     weights = torch.full((args.tokens, args.topk), 1 / args.topk, device="cuda")
     buffer = Buffer(dist.group.WORLD,
+                    # Coalesced low-latency builds keep per-node reader acknowledgements in the NVLink buffer.
+                    num_nvl_bytes=Buffer.get_dispatch_config(world).get_nvl_buffer_size_hint(args.hidden * 2, world),
                     num_rdma_bytes=Buffer.get_low_latency_rdma_size_hint(args.tokens, args.hidden, world, args.experts),
                     low_latency_mode=True, num_qps_per_rank=groups,
                     allow_nvlink_for_low_latency_mode=True, explicitly_destroy=True)
