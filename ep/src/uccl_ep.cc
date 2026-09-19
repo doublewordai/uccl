@@ -485,7 +485,7 @@ class Buffer {
                            static_cast<size_t>(barrier_signal_bytes) +
                            static_cast<size_t>(buffer_ptr_bytes) +
                            static_cast<size_t>(barrier_signal_ptr_bytes);
-#ifdef LANE_E_DISPATCH_NODE
+#ifdef LL_COALESCE
       // Stable across dispatch shapes/precision. The existing IPC handle
       // covers this suffix: [count, generation, reader generations...] per
       // source rank and ping-pong buffer, without another IPC mapping.
@@ -521,14 +521,14 @@ class Buffer {
 
       CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0,
                                  barrier_signal_bytes, comm_stream));
-#ifdef LANE_E_DISPATCH_NODE
+#ifdef LL_COALESCE
       CUDA_CHECK(cudaMemsetAsync(
           static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) +
               node_dispatch_control_offset,
           0, node_control_bytes, comm_stream));
 #endif
     }
-#ifdef LANE_E_DISPATCH_NODE
+#ifdef LL_COALESCE
     EP_HOST_ASSERT(!low_latency_mode || num_nvl_bytes > 0);
 #endif
 
@@ -1442,7 +1442,7 @@ class Buffer {
       int num_sms = 0, std::uintptr_t src_signals_ptr = 0,
       int src_signal_expect_value = 0) {
     EP_HOST_ASSERT(low_latency_mode);
-#ifdef LANE_E_COMBINE_DIRECT_SEND
+#ifdef LL_COALESCE
     EP_HOST_ASSERT(!use_logfmt && !zero_copy &&
                    "direct combine send requires BF16 input outside the RDMA send arena");
 #endif

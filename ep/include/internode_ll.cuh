@@ -29,8 +29,8 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               void* rdma_buffer_ptr = nullptr,
               void* atomic_buffer_ptr = nullptr,
               int64_t* rdma_recv_count_internode = nullptr,
-              // Lane E dest-rank coalescing staging (unused unless
-              // LANE_E_DESTRANK_COALESCE is compiled in).
+              // Coalesced dispatch staging (unused unless
+              // LL_COALESCE is compiled in).
               void* rdma_x_stage = nullptr, void* recv_stage = nullptr,
               int64_t* stage_flag_internode = nullptr,
               void** ipc_nvl_base_ptrs = nullptr,
@@ -50,8 +50,8 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              int low_latency_buffer_idx, void** ipc_rdma_base_ptrs = nullptr,
              void* rdma_buffer_ptr = nullptr, void* atomic_buffer_ptr = nullptr,
              int64_t* rdma_recv_flag_internode = nullptr,
-             // Lane E combine-side coalescing staging (unused unless
-             // LANE_E_COMBINE_COALESCE is compiled in).
+             // Coalesced combine staging (unused unless
+             // LL_COALESCE is compiled in).
              void* combine_send_stage = nullptr,
              void* combine_recv_stage = nullptr,
              int64_t* combine_stage_flag_internode = nullptr);
