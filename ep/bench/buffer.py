@@ -259,6 +259,10 @@ class Buffer:
         return os.path.exists(os.getenv("EFA_HOME", "/opt/amazon/efa"))
 
     @staticmethod
+    def _is_cxi() -> bool:
+        return os.getenv("UCCL_EP_TRANSPORT") == "cxi"
+
+    @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
         """
         Set the number of SMs to use in high-throughput kernels.
@@ -750,10 +754,16 @@ class Buffer:
         """
 
         # TODO: automatically tune
+        # CXI has a high fixed cost per RDMA command, so larger send chunks
+        # amortize it. Measured at 8 ranks on 4-GPU nodes (2 RDMA ranks), where
+        # 32 sits on the plateau of a 6..64 sweep; at 16 ranks (4 RDMA ranks)
+        # the same sweep showed no gain, so that row is unchanged. Receive
+        # capacity and other transports are unchanged.
+        cxi = Buffer._is_cxi()
         config_map = {
             2: Config(Buffer.num_sms, 24, 256, 6, 128),
             4: Config(Buffer.num_sms, 6, 256, 6, 128),
-            8: Config(Buffer.num_sms, 6, 256, 6, 128),
+            8: Config(Buffer.num_sms, 6, 256, 32 if cxi else 6, 128),
             16: Config(Buffer.num_sms, 36, 288, 20, 512 if Buffer._is_efa() else 128),
             24: Config(Buffer.num_sms, 8, 288, 32, 128),
             32: Config(Buffer.num_sms, 32, 288, 32, 512 if Buffer._is_efa() else 128),
@@ -778,10 +788,11 @@ class Buffer:
         """
 
         # TODO: automatically tune
+        cxi = Buffer._is_cxi()  # see get_dispatch_config
         config_map = {
             2: Config(Buffer.num_sms, 10, 256, 6, 128),
             4: Config(Buffer.num_sms, 9, 256, 6, 128),
-            8: Config(Buffer.num_sms, 4, 256, 6, 128),
+            8: Config(Buffer.num_sms, 4, 256, 32 if cxi else 6, 128),
             16: Config(Buffer.num_sms, 4, 288, 12, 512 if Buffer._is_efa() else 128),
             24: Config(Buffer.num_sms, 1, 288, 8, 128),
             32: Config(Buffer.num_sms, 1, 288, 8, 512 if Buffer._is_efa() else 128),
