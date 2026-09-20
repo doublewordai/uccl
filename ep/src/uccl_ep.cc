@@ -748,8 +748,8 @@ class Buffer {
     uccl::intranode::notify_dispatch(
         num_tokens_per_rank, moe_recv_counter_mapped, num_ranks,
         num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts,
-        num_tokens, is_token_in_rank, channel_prefix_matrix, rank_prefix_matrix,
-        num_memset_int, expert_alignment, buffer_ptrs_gpu,
+        num_tokens, num_worst_tokens, is_token_in_rank, channel_prefix_matrix,
+        rank_prefix_matrix, num_memset_int, expert_alignment, buffer_ptrs_gpu,
         barrier_signal_ptrs_gpu, rank, comm_stream, num_channels);
 
     int num_recv_tokens = -1;
