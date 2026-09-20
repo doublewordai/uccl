@@ -1,7 +1,7 @@
 """LL batching regression: writes over 16 MiB and over 8191 staged messages.
 
 Run with torchrun on at least two nodes, using a build with
-PER_EXPERT_BATCHING=1 or both LANE_E_*_COALESCE options enabled.
+PER_EXPERT_BATCHING=1 or LL_COALESCE=1.
 Defaults use 2048 tokens, H=6144, top-k=8: each expert batch is 24 MiB,
 and the coalesced destination batch has 16384 messages. Every iteration
 changes inputs; expert outputs are regenerated after each dispatch.
