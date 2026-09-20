@@ -86,7 +86,8 @@ class RDMAEndpoint {
 
   void check_send_complete(uint64_t peer_id, int64_t wr_id);
 
-  bool check_send_complete_once(uint64_t peer_id, int64_t wr_id);
+  bool check_send_complete_once(uint64_t peer_id, int64_t wr_id,
+                                bool* failed = nullptr);
 
   // Resolve the SendConnection for a peer_id once so callers can poll many
   // completions without re-acquiring the mutex + map lookup per check.
