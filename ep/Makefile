@@ -109,6 +109,24 @@ ifeq ($(PER_EXPERT_BATCHING),1)
   override NVCCFLAGS += -DPER_EXPERT_BATCHING
 endif
 
+# Coalesced low-latency mode (default: disabled). Remote dispatch and combine
+# payloads are staged and sent as one RDMA write per destination instead of one
+# write per expert: one dispatch payload per (token, destination node), read in
+# place from the receive staging area, and combine messages packed directly
+# from the expert output. It is an alternative to PER_EXPERT_BATCHING and
+# changes the buffer layout and wire format, so every rank must use the same
+# setting. Requires num_topk <= 8, at most 64 experts per rank when ranks span
+# nodes, and a non-empty NVLink buffer (it carries the per-node reader
+# acknowledgements); native zero-copy combine and LogFMT are rejected.
+LL_COALESCE ?= 0
+ifeq ($(LL_COALESCE),1)
+  ifeq ($(PER_EXPERT_BATCHING),1)
+    $(error LL_COALESCE and PER_EXPERT_BATCHING are mutually exclusive)
+  endif
+  override CXXFLAGS += -DLL_COALESCE
+  override NVCCFLAGS += -DLL_COALESCE
+endif
+
 ifdef NUM_MAX_NVL_PEERS
   override CXXFLAGS += -DNUM_MAX_NVL_PEERS=$(NUM_MAX_NVL_PEERS)
   override NVCCFLAGS += -DNUM_MAX_NVL_PEERS=$(NUM_MAX_NVL_PEERS)

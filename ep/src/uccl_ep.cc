@@ -485,6 +485,15 @@ class Buffer {
                            static_cast<size_t>(barrier_signal_bytes) +
                            static_cast<size_t>(buffer_ptr_bytes) +
                            static_cast<size_t>(barrier_signal_ptr_bytes);
+#ifdef LL_COALESCE
+      // Stable across dispatch shapes/precision. The existing IPC handle
+      // covers this suffix: [count, generation, reader generations...] per
+      // source rank and ping-pong buffer, without another IPC mapping.
+      node_dispatch_control_offset = total_bytes;
+      size_t const node_control_bytes =
+          2 * static_cast<size_t>(num_ranks) * (max_nvl_peers + 2) * sizeof(int);
+      total_bytes += node_control_bytes;
+#endif
 
       // Ensure we're on the correct device before memory allocation and IPC
       // handle creation
@@ -512,7 +521,16 @@ class Buffer {
 
       CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0,
                                  barrier_signal_bytes, comm_stream));
+#ifdef LL_COALESCE
+      CUDA_CHECK(cudaMemsetAsync(
+          static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) +
+              node_dispatch_control_offset,
+          0, node_control_bytes, comm_stream));
+#endif
     }
+#ifdef LL_COALESCE
+    EP_HOST_ASSERT(!low_latency_mode || num_nvl_bytes > 0);
+#endif
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     CUDA_CHECK(hipExtMallocWithFlags(&workspace, NUM_WORKSPACE_BYTES,
@@ -1380,7 +1398,10 @@ class Buffer {
           use_ue8m0, workspace, num_device_sms, launch_stream, phases,
           d_handles, num_d2h_channel_addrs, max_nvl_peers,
           low_latency_buffer_idx_used, d_ipc_rdma_base_ptrs, rdma_buffer_ptr,
-          atomic_buffer_ptr, buffer.dispatch_rdma_recv_count_buffer_internode);
+          atomic_buffer_ptr, buffer.dispatch_rdma_recv_count_buffer_internode,
+          buffer.dispatch_rdma_x_stage, buffer.dispatch_recv_stage,
+          buffer.dispatch_stage_flag_internode, buffer_ptrs_gpu,
+          node_dispatch_control_offset);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
@@ -1421,6 +1442,10 @@ class Buffer {
       int num_sms = 0, std::uintptr_t src_signals_ptr = 0,
       int src_signal_expect_value = 0) {
     EP_HOST_ASSERT(low_latency_mode);
+#ifdef LL_COALESCE
+    EP_HOST_ASSERT(!use_logfmt && !zero_copy &&
+                   "direct combine send requires BF16 input outside the RDMA send arena");
+#endif
     EP_HOST_ASSERT(topk_rows == 0 ||
                    (x_ptr != 0 && topk_idx_ptr != 0 && topk_weights_ptr != 0));
     EP_HOST_ASSERT(topk_rows == 0 ||
@@ -1495,7 +1520,9 @@ class Buffer {
           num_device_sms, launch_stream, phases, zero_copy, d_handles,
           num_d2h_channel_addrs, max_nvl_peers, low_latency_buffer_idx_used,
           d_ipc_rdma_base_ptrs, rdma_buffer_ptr, atomic_buffer_ptr,
-          buffer.combine_rdma_recv_flag_buffer_internode);
+          buffer.combine_rdma_recv_flag_buffer_internode,
+          buffer.combine_send_stage, buffer.combine_recv_stage,
+          buffer.combine_stage_flag_internode);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
@@ -1734,6 +1761,7 @@ class Buffer {
   bool available{false};
   void* rdma_buffer_ptr = nullptr;
   void* atomic_buffer_ptr = nullptr;
+  size_t node_dispatch_control_offset = 0;
   int low_latency_buffer_idx = 0;
   void* workspace = nullptr;
 

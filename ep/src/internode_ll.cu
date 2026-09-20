@@ -58,6 +58,16 @@ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0, int* clean_1,
 #undef CLEAN_LL_LAUNCH_CASE
 }
 
+#ifdef LL_COALESCE
+__device__ __forceinline__ int* node_dispatch_control(
+    void** ipc_nvl_base_ptrs, size_t offset, int peer, int buffer_idx,
+    int num_ranks, int num_peers, int source) {
+  return reinterpret_cast<int*>(
+             static_cast<uint8_t*>(ipc_nvl_base_ptrs[peer]) + offset) +
+         (buffer_idx * num_ranks + source) * (num_peers + 2);
+}
+#endif
+
 template <bool kUseFP8, bool kUseUE8M0, int kHidden, bool kUseAggressiveAtomic>
 __global__ __launch_bounds__(1024, 1) void dispatch(
     void* packed_recv_x, void* packed_recv_x_scales, int* packed_recv_src_info,
@@ -75,6 +85,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
     void** ipc_rdma_base_ptrs = nullptr, void* rdma_buffer_ptr = nullptr,
     void* atomic_buffer_ptr = nullptr,
     int64_t* rdma_recv_count_internode = nullptr,
+    void* rdma_x_stage = nullptr, void* recv_stage = nullptr,
+    int64_t* stage_flag_internode = nullptr,
+    void** ipc_nvl_base_ptrs = nullptr, size_t node_control_offset = 0,
     int* grid_sync_barrier_ptr = nullptr) {
   auto const sm_id = static_cast<int>(blockIdx.x);
   auto const thread_id = static_cast<int>(threadIdx.x);
@@ -85,6 +98,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
   auto const warp_group_id = warp_id / num_warps_per_group;
   auto const sub_warp_id = warp_id % num_warps_per_group;
   auto const responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+#ifdef LL_COALESCE
+  __shared__ int node_generations[kNumMaxWarpGroups];
+#endif
 
   // May extract UE8M0 from the scales
   using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
@@ -107,6 +123,19 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
                               : (kHidden * sizeof(nv_bfloat16)));
   size_t const num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
   EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
+
+#ifdef LL_COALESCE
+  // Dest-rank coalescing staging geometry (must match LowLatencyLayout's
+  // coalesce_* sizing). `stage_send_count` reuses the send-counter workspace
+  // slot but holds one running count per destination rank (num_ranks entries).
+  int const coalesce_cap_per_token = min(num_local_experts, 8);
+  size_t const coalesce_max_msgs_per_dst =
+      static_cast<size_t>(num_max_dispatch_tokens_per_rank) *
+      coalesce_cap_per_token;
+  size_t const coalesce_stage_bytes_per_rank =
+      coalesce_max_msgs_per_dst * num_bytes_per_msg;
+  int* const stage_send_count = atomic_send_counter_per_expert;  // [num_ranks]
+#endif
 
   // Expert counts
   __shared__ int shared_num_tokens_sent_per_expert[kNumMaxWarpGroups];
@@ -258,7 +287,57 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
                                         dst_rank, max_nvl_peers, 0)
                 : 0;
         if (dst_p2p_ptr == 0) {
-#ifdef PER_EXPERT_BATCHING
+#ifdef LL_COALESCE
+          // Dest-rank coalescing: append this token's message to the per-dst
+          // rank staging buffer instead of issuing a per-token RDMA put. One
+          // large put per destination rank is issued after a grid sync below.
+          // The receiver reconstructs the per-expert layout by scanning, so
+          // carry the destination local-expert index in the reserved header
+          // int (header[1]) of the *staged* copy — the per-token temp header
+          // is shared across this token's top-k warps, so it must not be
+          // written there.
+          // One packet per destination node. Keep the ordered local-node
+          // expert list, including duplicates, in the three spare header words.
+          int const experts_per_node = num_local_experts * max_nvl_peers;
+          int const dst_node = dst_rank / max_nvl_peers;
+          int const stage_dst_rank =
+              dst_node * max_nvl_peers + rank % max_nvl_peers;
+          uint64_t expert_list = 0;
+          int expert_list_count = 0, emit = 1;
+          if (lane_id == 0) {
+            for (int j = 0; j < num_topk; ++j) {
+              int const expert = static_cast<int>(
+                  __ldg(topk_idx + token_idx * num_topk + j));
+              if (expert >= 0 && expert / experts_per_node == dst_node) {
+                if (j < warp_id) emit = 0;
+                expert_list |= static_cast<uint64_t>(expert % experts_per_node)
+                               << (8 * expert_list_count++);
+              }
+            }
+          }
+          emit = __shfl_sync(WARP_MASK, emit, 0);
+          if (emit) {
+          int stage_pos =
+              lane_id == 0 ? atomicAdd(stage_send_count + stage_dst_rank, 1) : 0;
+          stage_pos = __shfl_sync(WARP_MASK, stage_pos, 0);
+          auto* stage_dst_u8 = static_cast<uint8_t*>(rdma_x_stage) +
+                               stage_dst_rank * coalesce_stage_bytes_per_rank +
+                               stage_pos * num_bytes_per_msg;
+          auto* stage_dst_int4 = reinterpret_cast<int4*>(stage_dst_u8);
+          auto const* stage_src_int4 =
+              reinterpret_cast<int4 const*>(rdma_x_src_idx);
+          UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, stage_dst_int4,
+                             stage_src_int4, ld_nc_global, st_na_global);
+          __syncwarp();
+          if (lane_id == 0) {
+            reinterpret_cast<uint32_t*>(stage_dst_u8)[1] =
+                static_cast<uint32_t>(expert_list);
+            reinterpret_cast<uint32_t*>(stage_dst_u8)[2] =
+                static_cast<uint32_t>(expert_list >> 32);
+            reinterpret_cast<int*>(stage_dst_u8)[3] = expert_list_count;
+          }
+          }
+#elif defined(PER_EXPERT_BATCHING)
           // For inter-node send path, copy temp data to the per-expert batch
           // buffer, then issue a batched RDMA send.
           // TODO: This has an extra temp->per-expert copy in the FP8 path.
@@ -412,6 +491,78 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
   __threadfence_system();  // Ensure batch sends are visible before count sends
 #endif
 
+#ifdef LL_COALESCE
+  // Grid-wide sync so all staging packing is complete before the coalesced
+  // per-dst-rank sends read the staging buffers and per-dst counts.
+  cg::this_grid().sync();
+
+  // One warp-group per destination rank (its local-expert-0 representative)
+  // issues a single large put of that rank's staged messages. Intra-node
+  // destinations already delivered via IPC in the token loop and are skipped.
+  if (responsible_expert_idx < num_experts && sub_warp_id == 0 &&
+      (responsible_expert_idx % num_local_experts) == 0
+      && (responsible_expert_idx / num_local_experts) % max_nvl_peers ==
+             rank % max_nvl_peers
+      ) {
+    auto const dst_rank = responsible_expert_idx / num_local_experts;
+    auto const test_dst_ptr = reinterpret_cast<uint64_t>(recv_stage);
+    auto const dst_p2p_ptr =
+        ipc_rdma_base_ptrs
+            ? uccl::get_ipc_p2p_ptr(test_dst_ptr, ipc_rdma_base_ptrs, rank,
+                                    dst_rank, max_nvl_peers, 0)
+            : 0;
+    if (dst_p2p_ptr == 0) {  // inter-node only
+      auto const n = stage_send_count[dst_rank];
+      if (n > 0) {
+        auto const src_ptr = reinterpret_cast<uint64_t>(
+            static_cast<uint8_t*>(rdma_x_stage) +
+            dst_rank * coalesce_stage_bytes_per_rank);
+        // Symmetric: land in dst_rank's recv_stage region for src = this rank.
+        auto const dst_ptr = reinterpret_cast<uint64_t>(
+            static_cast<uint8_t*>(recv_stage) +
+            rank * coalesce_stage_bytes_per_rank);
+        auto const total_bytes = static_cast<size_t>(n) * num_bytes_per_msg;
+        __threadfence_system();
+        uccl::nvshmemi_ibgda_put_nbi_warp(
+            dst_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr),
+            src_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr), total_bytes,
+            dst_rank, /*expert_idx=*/dst_rank, lane_id, /*slot=*/0,
+            d2h_channel_addrs, num_d2h_channel_addrs, false,
+            low_latency_buffer_idx, 0, 0, static_cast<int>(n));
+      }
+    }
+  }
+
+  __threadfence_system();  // ensure the coalesced put is visible before flag
+
+  // Post one arrival flag per destination rank (always, even when n==0, so the
+  // receiver's per-src wait never hangs). Same channel selector (dst_rank) as
+  // the put above, so the proxy delivers data before flag.
+  if (responsible_expert_idx < num_experts && sub_warp_id == 0 &&
+      lane_id == 0 && (responsible_expert_idx % num_local_experts) == 0
+      && (responsible_expert_idx / num_local_experts) % max_nvl_peers ==
+             rank % max_nvl_peers
+      ) {
+    auto const dst_rank = responsible_expert_idx / num_local_experts;
+    auto const test_dst_ptr = reinterpret_cast<uint64_t>(recv_stage);
+    auto const dst_p2p_ptr =
+        ipc_rdma_base_ptrs
+            ? uccl::get_ipc_p2p_ptr(test_dst_ptr, ipc_rdma_base_ptrs, rank,
+                                    dst_rank, max_nvl_peers, 0)
+            : 0;
+    if (dst_p2p_ptr == 0) {  // inter-node
+      auto const n = stage_send_count[dst_rank];
+      auto const flag_dst =
+          reinterpret_cast<uint64_t>(stage_flag_internode + rank);
+      uccl::nvshmemi_ibgda_amo_nonfetch_add(
+          flag_dst, reinterpret_cast<uint64_t>(atomic_buffer_ptr), -n - 1,
+          dst_rank, /*warp_id=*/dst_rank, false, d2h_channel_addrs,
+          num_d2h_channel_addrs, false, low_latency_buffer_idx);
+      stage_send_count[dst_rank] = 0;  // reset for next iteration
+    }
+  }
+#endif
+
   // Issue count sends
   if (responsible_expert_idx < num_experts and sub_warp_id == 0 and
       lane_id == 0) {
@@ -421,16 +572,6 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
     auto const num_tokens_sent =
         shared_num_tokens_sent_per_expert[responsible_expert_idx -
                                           sm_id * num_warp_groups];
-    // Wait local sends issued and send expert counts
-    while (ld_acquire_global<kUseAggressiveAtomic>(
-               atomic_finish_counter_per_expert + responsible_expert_idx) !=
-           FINISHED_SUM_TAG * 2)
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-      __builtin_amdgcn_s_sleep(1);
-#else
-      ;
-#endif
-
     auto dst_ptr = reinterpret_cast<uint64_t>(
         rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
     auto dst_ptr_internode = reinterpret_cast<uint64_t>(
@@ -441,6 +582,31 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
             ? uccl::get_ipc_p2p_ptr(dst_ptr, ipc_rdma_base_ptrs, rank, dst_rank,
                                     max_nvl_peers, 0)
             : 0;
+#ifdef LL_COALESCE
+    // Coalesce: inter-node experts are delivered by the per-dst-rank put+flag
+    // above (their counts are reconstructed locally by the recv scatter); only
+    // intra-node experts still post a per-expert IPC count here. The
+    // finish-counter accounting for inter experts is left unwaited (grid sync
+    // ordered the staging), then reset in the cleanup below.
+    if (dst_p2p_ptr != 0) {
+      while (ld_acquire_global<kUseAggressiveAtomic>(
+                 atomic_finish_counter_per_expert + responsible_expert_idx) !=
+             FINISHED_SUM_TAG * 2)
+        ;
+      st_release_sys_global<kUseAggressiveAtomic>(
+          reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
+    }
+#else
+    // Wait local sends issued and send expert counts
+    while (ld_acquire_global<kUseAggressiveAtomic>(
+               atomic_finish_counter_per_expert + responsible_expert_idx) !=
+           FINISHED_SUM_TAG * 2)
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+      __builtin_amdgcn_s_sleep(1);
+#else
+      ;
+#endif
+
     if (dst_p2p_ptr == 0) {
       // Inter-node or no IPC: use IBGDA atomic
       uccl::nvshmemi_ibgda_amo_nonfetch_add(
@@ -454,6 +620,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
       st_release_sys_global<kUseAggressiveAtomic>(
           reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
     }
+#endif
     // Clean workspace for next use
     atomic_counter_per_expert[responsible_expert_idx] = 0;
     atomic_finish_counter_per_expert[responsible_expert_idx] = 0;
@@ -478,6 +645,112 @@ LOW_LATENCY_DISPATCH_RECV:
     amd::grid_sync_then_zero(grid_sync_barrier_ptr, num_sms);
 #else
     cg::this_grid().sync();
+#endif
+
+#ifdef LL_COALESCE
+  // R1: per-src-rank scatter from the coalesced recv staging back into the
+  // per-expert recv layout (rdma_recv_x[local_expert][src_rank][slot]) that the
+  // existing recv-copy below consumes unchanged. One warp-group per source rank
+  // (its local-expert-0 representative). Intra-node sources already landed via
+  // IPC, so only inter-node sources are scattered here.
+  {
+    __shared__ int coalesce_slot[kNumMaxWarpGroups][64];
+    __shared__ int coalesce_total[kNumMaxWarpGroups];
+    bool const is_scatter_rep =
+        (responsible_expert_idx < num_experts) &&
+        ((responsible_expert_idx % num_local_experts) == 0);
+    auto const scatter_src_rank = responsible_expert_idx / num_local_experts;
+    bool const scatter_is_inter =
+        is_scatter_rep &&
+        (scatter_src_rank / max_nvl_peers != rank / max_nvl_peers);
+    if (scatter_is_inter) {
+      EP_DEVICE_ASSERT(num_local_experts <= 64);
+      int* slot_row = coalesce_slot[warp_group_id];
+      auto const group_tid = sub_warp_id * WARP_SIZE + lane_id;
+      auto const group_threads = num_warps_per_group * WARP_SIZE;
+      for (int e = group_tid; e < num_local_experts; e += group_threads)
+        slot_row[e] = 0;
+      sync_barrier<true>(warp_group_id + 2, group_threads);
+
+      // Wait for this source rank's coalesced arrival flag; decode token count.
+      if (sub_warp_id == 0 && lane_id == 0) {
+        int const gateway = scatter_src_rank % max_nvl_peers;
+        auto* own_control = node_dispatch_control(
+            ipc_nvl_base_ptrs, node_control_offset, rank % max_nvl_peers,
+            low_latency_buffer_idx, num_ranks, max_nvl_peers, scatter_src_rank);
+        auto* shared_control = node_dispatch_control(
+            ipc_nvl_base_ptrs, node_control_offset, gateway,
+            low_latency_buffer_idx, num_ranks, max_nvl_peers, scatter_src_rank);
+        int const previous = ld_acquire_sys_global(own_control + 1);
+        int const generation = previous == 0x7fffffff ? 1 : previous + 1;
+        node_generations[warp_group_id] = generation;
+        if (rank % max_nvl_peers == gateway) {
+          int64_t v;
+          while ((v = static_cast<int64_t>(ld_acquire_sys_global(
+                      reinterpret_cast<uint64_t const*>(
+                          stage_flag_internode + scatter_src_rank)))) == 0)
+            ;
+          // Publish immutable count before the generation. All other GPUs
+          // acquire this generation before reading the gateway's RDMA arena.
+          __threadfence_system();
+          st_release_sys_global(shared_control, static_cast<int>(-v - 1));
+          st_release_sys_global(shared_control + 1, generation);
+        } else {
+          while (ld_acquire_sys_global(shared_control + 1) != generation)
+            ;
+        }
+        coalesce_total[warp_group_id] = ld_acquire_sys_global(shared_control);
+      }
+      sync_barrier<true>(warp_group_id + 2, group_threads);
+      int const total = coalesce_total[warp_group_id];
+      EP_DEVICE_ASSERT(total <= static_cast<int>(coalesce_max_msgs_per_dst));
+
+      auto* src_base = static_cast<uint8_t*>(recv_stage) +
+                       scatter_src_rank * coalesce_stage_bytes_per_rank;
+      int const gateway_rank = (rank / max_nvl_peers) * max_nvl_peers +
+                               scatter_src_rank % max_nvl_peers;
+      src_base = reinterpret_cast<uint8_t*>(uccl::get_ipc_p2p_ptr(
+          reinterpret_cast<uint64_t>(src_base), ipc_rdma_base_ptrs, rank,
+          gateway_rank, max_nvl_peers, 0));
+      EP_DEVICE_ASSERT(src_base != nullptr);
+      for (int t = sub_warp_id; t < total; t += num_warps_per_group) {
+        auto* msg_u8 = src_base + static_cast<size_t>(t) * num_bytes_per_msg;
+        uint64_t const expert_list =
+            static_cast<uint64_t>(reinterpret_cast<uint32_t const*>(msg_u8)[1]) |
+            (static_cast<uint64_t>(reinterpret_cast<uint32_t const*>(msg_u8)[2]) << 32);
+        int const list_count = reinterpret_cast<int const*>(msg_u8)[3];
+        EP_DEVICE_ASSERT(list_count >= 0 && list_count <= 8);
+        for (int j = 0; j < list_count; ++j) {
+          int const node_expert = (expert_list >> (j * 8)) & 255;
+          if (node_expert / num_local_experts != rank % max_nvl_peers) continue;
+          int const le = node_expert % num_local_experts;
+        int slot = lane_id == 0 ? atomicAdd(&slot_row[le], 1) : 0;
+        slot = __shfl_sync(WARP_MASK, slot, 0);
+        auto* dst_u8 =
+            static_cast<uint8_t*>(rdma_recv_x) +
+            (static_cast<size_t>(le) * num_ranks *
+                 num_max_dispatch_tokens_per_rank +
+             static_cast<size_t>(scatter_src_rank) *
+                 num_max_dispatch_tokens_per_rank +
+             slot) *
+                num_bytes_per_msg;
+        // The receive stage remains live through this dispatch. Publish only
+        // its message index; the final expert-pack pass reads the payload there.
+        if (lane_id == 0) *reinterpret_cast<int*>(dst_u8) = t;
+        }
+      }
+      sync_barrier<true>(warp_group_id + 2, group_threads);
+
+      // Publish per-expert counts (sign-encoded) so the recv-copy below unblocks
+      // exactly as it would for the per-expert internode atomic.
+      for (int e = group_tid; e < num_local_experts; e += group_threads)
+        rdma_recv_count_internode[e * num_ranks + scatter_src_rank] =
+            -slot_row[e] - 1;
+    }
+  }
+
+  // All scatters + local count writes complete before the recv-copy reads them.
+  cg::this_grid().sync();
 #endif
 
   // Receiving and packing
@@ -601,8 +874,23 @@ LOW_LATENCY_DISPATCH_RECV:
     EP_DEVICE_ASSERT(num_scales <= 64);
     for (int i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group) {
       // Copy source info
-      auto const src_src_idx =
+      auto* src_src_idx =
           reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
+#ifdef LL_COALESCE
+      if (src_rank / max_nvl_peers != rank / max_nvl_peers) {
+        int const staged_index = ld_nc_global(src_src_idx);
+        src_src_idx = reinterpret_cast<int*>(
+            static_cast<uint8_t*>(recv_stage) +
+            src_rank * coalesce_stage_bytes_per_rank +
+            static_cast<size_t>(staged_index) * num_bytes_per_msg);
+        int const gateway_rank = (rank / max_nvl_peers) * max_nvl_peers +
+                                 src_rank % max_nvl_peers;
+        src_src_idx = reinterpret_cast<int*>(uccl::get_ipc_p2p_ptr(
+            reinterpret_cast<uint64_t>(src_src_idx), ipc_rdma_base_ptrs, rank,
+            gateway_rank, max_nvl_peers, 0));
+        EP_DEVICE_ASSERT(src_src_idx != nullptr);
+      }
+#endif
       if (lane_id == 0)
         recv_src_info[recv_token_begin_idx + i] = ld_nc_global(src_src_idx);
       __syncwarp();
@@ -650,6 +938,37 @@ LOW_LATENCY_DISPATCH_RECV:
     // if (blockIdx.x == 0 && threadIdx.x == 0)
     //   printf("[dispatch] RECV finished\n");
   }
+#ifdef LL_COALESCE
+  if (num_ranks > max_nvl_peers) {
+    // No gateway can finish this receive until every local GPU has finished
+    // reading its payloads. Per-reader generations avoid counter reset/ABA
+    // races, including changing-input graph replay and empty source ranks.
+    cg::this_grid().sync();
+    if (responsible_expert_idx < num_experts && sub_warp_id == 0 && lane_id == 0 &&
+        responsible_expert_idx % num_local_experts == 0) {
+      int const source = responsible_expert_idx / num_local_experts;
+      if (source / max_nvl_peers != rank / max_nvl_peers) {
+        int const gateway = source % max_nvl_peers;
+        int const generation = node_generations[warp_group_id];
+        auto* own_control = node_dispatch_control(
+            ipc_nvl_base_ptrs, node_control_offset, rank % max_nvl_peers,
+            low_latency_buffer_idx, num_ranks, max_nvl_peers, source);
+        auto* shared_control = node_dispatch_control(
+            ipc_nvl_base_ptrs, node_control_offset, gateway,
+            low_latency_buffer_idx, num_ranks, max_nvl_peers, source);
+        if (rank % max_nvl_peers != gateway)
+          st_release_sys_global(own_control + 1, generation);
+        st_release_sys_global(shared_control + 2 + rank % max_nvl_peers,
+                              generation);
+        if (rank % max_nvl_peers == gateway) {
+          for (int peer = 0; peer < max_nvl_peers; ++peer)
+            while (ld_acquire_sys_global(shared_control + 2 + peer) != generation)
+              ;
+        }
+      }
+    }
+  }
+#endif
 }
 
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
@@ -666,8 +985,27 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
               int max_nvl_peers, int low_latency_buffer_idx,
               void** ipc_rdma_base_ptrs, void* rdma_buffer_ptr,
-              void* atomic_buffer_ptr, int64_t* rdma_recv_count_internode) {
+              void* atomic_buffer_ptr, int64_t* rdma_recv_count_internode,
+              void* rdma_x_stage, void* recv_stage,
+              int64_t* stage_flag_internode, void** ipc_nvl_base_ptrs,
+              size_t node_control_offset) {
   constexpr int kNumMaxTopK = 16;
+#ifdef LL_COALESCE
+  // Remote scatter uses 64 local-expert counters (and dedup a 64-bit mask).
+  EP_HOST_ASSERT((num_ranks <= max_nvl_peers || num_experts / num_ranks <= 64) &&
+                 "coalesced remote dispatch supports at most 64 local experts");
+  // The coalesce staging is sized for a per-token fan-out cap of 8.
+  EP_HOST_ASSERT(num_topk <= 8 &&
+                 "LL_COALESCE staging assumes num_topk <= 8");
+  EP_HOST_ASSERT(rdma_x_stage != nullptr && recv_stage != nullptr &&
+                 stage_flag_internode != nullptr);
+#endif
+#ifdef LL_COALESCE
+  EP_HOST_ASSERT(ipc_nvl_base_ptrs != nullptr && node_control_offset != 0);
+  EP_HOST_ASSERT((num_ranks <= max_nvl_peers ||
+                  (num_experts / num_ranks) * max_nvl_peers <= 256) &&
+                 "node dispatch header supports at most 256 experts per node");
+#endif
   int const num_warp_groups = ceil_div(num_experts, num_device_sms);
   int const num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
   EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0);
@@ -681,7 +1019,14 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
   auto atomic_counter_per_expert = static_cast<int*>(workspace);
   auto atomic_finish_counter_per_expert =
       atomic_counter_per_expert + num_experts;
-#ifdef PER_EXPERT_BATCHING
+#ifdef LL_COALESCE
+  // Coalesce reuses the send-counter slot as stage_send_count[num_ranks].
+  auto atomic_send_counter_per_expert =
+      atomic_finish_counter_per_expert + num_experts;
+  auto grid_sync_barrier_ptr = atomic_send_counter_per_expert + num_ranks;
+  EP_HOST_ASSERT((num_experts * 2 + num_ranks + 1) * sizeof(int) <=
+                 NUM_WORKSPACE_BYTES);
+#elif defined(PER_EXPERT_BATCHING)
   auto atomic_send_counter_per_expert =
       atomic_finish_counter_per_expert + num_experts;
   auto grid_sync_barrier_ptr = atomic_send_counter_per_expert + num_experts;
@@ -724,7 +1069,9 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         num_warps_per_group, round_scale, phases, d2h_channel_addrs,       \
         num_d2h_channel_addrs, max_nvl_peers, low_latency_buffer_idx,      \
         ipc_rdma_base_ptrs, rdma_buffer_ptr, atomic_buffer_ptr,            \
-        rdma_recv_count_internode, grid_sync_barrier_ptr);                 \
+        rdma_recv_count_internode, rdma_x_stage, recv_stage,              \
+        stage_flag_internode, ipc_nvl_base_ptrs, node_control_offset,      \
+        grid_sync_barrier_ptr);                                          \
   }                                                                        \
   break
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
@@ -758,7 +1105,9 @@ __global__ __launch_bounds__(1024, 1) void combine(
     void** ipc_rdma_base_ptrs = nullptr, void* rdma_buffer_ptr = nullptr,
     void* atomic_buffer_ptr = nullptr,
     int64_t* rdma_recv_flag_internode = nullptr,
-    int* grid_sync_barrier_ptr = nullptr) {
+    void* combine_send_stage = nullptr, void* combine_recv_stage = nullptr,
+    int64_t* combine_stage_flag_internode = nullptr,
+    int* combine_stage_count = nullptr, int* grid_sync_barrier_ptr = nullptr) {
   auto const sm_id = static_cast<int>(blockIdx.x);
   auto const num_sms = static_cast<int>(gridDim.x);
   auto const thread_id = static_cast<int>(threadIdx.x);
@@ -782,6 +1131,18 @@ __global__ __launch_bounds__(1024, 1) void combine(
   constexpr size_t num_bytes_per_slot = kHidden * sizeof(nv_bfloat16);
   EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0,
                    "Invalid vectorization");
+
+#ifdef LL_COALESCE
+  // Combine dest-rank coalescing staging geometry (must match LowLatencyLayout's
+  // cmb_* sizing). Each staged entry is a 16-byte (global_expert, src_idx)
+  // header followed by the bf16 message.
+  int const cmb_cap_per_token = min(num_local_experts, 8);
+  size_t const cmb_max_msgs_per_dst =
+      static_cast<size_t>(num_max_dispatch_tokens_per_rank) * cmb_cap_per_token;
+  size_t const cmb_stage_entry_bytes = sizeof(int4) + num_bytes_per_slot;
+  size_t const cmb_stage_bytes_per_rank =
+      cmb_max_msgs_per_dst * cmb_stage_entry_bytes;
+#endif
 
   // Sending phase
   if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_COMBINE_RECV;
@@ -814,10 +1175,12 @@ __global__ __launch_bounds__(1024, 1) void combine(
                                           hidden_bf16_int4;
     auto const local_src_info = src_info + local_expert_idx * num_ranks *
                                                num_max_dispatch_tokens_per_rank;
+#ifndef LL_COALESCE
     auto const rdma_send_x_vec = static_cast<uint8_t*>(rdma_send_x) +
                                  local_expert_idx * num_ranks *
                                      num_max_dispatch_tokens_per_rank *
                                      num_bytes_per_slot;
+#endif
 
     // Unpack layout
     int offset, num_tokens_to_send;
@@ -871,14 +1234,18 @@ __global__ __launch_bounds__(1024, 1) void combine(
          token_idx < offset + num_tokens_to_send;
          token_idx += num_warps_per_group) {
       auto const x_int4 = local_x + token_idx * hidden_bf16_int4;
+#ifndef LL_COALESCE
       auto const rdma_send_type_row = reinterpret_cast<int*>(
           rdma_send_x_vec + token_idx * num_bytes_per_slot);
       auto const rdma_send_x_vec_row =
           reinterpret_cast<uint8_t*>(rdma_send_type_row);
+#endif
 
       auto const src_idx =
           __shfl_sync(WARP_MASK, __ldg(local_src_info + token_idx), 0);
+#ifndef LL_COALESCE
       auto const buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
+#endif
       auto const dst_ptr =
           reinterpret_cast<uint64_t>(rdma_recv_x) +
           (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) *
@@ -897,6 +1264,11 @@ __global__ __launch_bounds__(1024, 1) void combine(
                                       dst_rank, max_nvl_peers, 0)
               : 0;
 
+#ifdef LL_COALESCE
+      if (dst_p2p_ptr != 0) {
+        auto const cpy_src_int4_ptr = x_int4;
+        auto const cpy_dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
+#else
       if (not zero_copy or dst_p2p_ptr != 0) {
         // Read from `cpy_src_int4_ptr` and copy into `cpy_dst_int4_ptr`
         auto const cpy_src_int4_ptr =
@@ -904,6 +1276,7 @@ __global__ __launch_bounds__(1024, 1) void combine(
         auto const cpy_dst_int4_ptr =
             dst_p2p_ptr == 0 ? reinterpret_cast<int4*>(buf_ptr)
                              : reinterpret_cast<int4*>(dst_p2p_ptr);
+#endif
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         // TODO:  Simulated cast
@@ -1032,6 +1405,25 @@ __global__ __launch_bounds__(1024, 1) void combine(
       // NOTES: for zero-copy mode, we assume the data is already in the send
       // buffer
       if (dst_p2p_ptr == 0) {
+#ifdef LL_COALESCE
+        // Coalesce: append this token's bf16 result to the per-dst staging with
+        // a (global_expert, src_idx) header, instead of a per-token put. One
+        // large put per dst-rank is issued after a grid sync below.
+        int cpos =
+            lane_id == 0 ? atomicAdd(combine_stage_count + dst_rank, 1) : 0;
+        cpos = __shfl_sync(WARP_MASK, cpos, 0);
+        auto* cstage_u8 = static_cast<uint8_t*>(combine_send_stage) +
+                          dst_rank * cmb_stage_bytes_per_rank +
+                          cpos * cmb_stage_entry_bytes;
+        if (lane_id == 0) {
+          reinterpret_cast<int*>(cstage_u8)[0] = global_expert_idx;
+          reinterpret_cast<int*>(cstage_u8)[1] = static_cast<int>(src_idx);
+        }
+        auto* cdst_int4 = reinterpret_cast<int4*>(cstage_u8 + sizeof(int4));
+        auto const* csrc_int4 = x_int4;
+        UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, cdst_int4, csrc_int4,
+                           ld_nc_global, st_na_global);
+#else
         __threadfence_system();
         nvshmemi_ibgda_put_nbi_warp(
             dst_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr),
@@ -1042,6 +1434,7 @@ __global__ __launch_bounds__(1024, 1) void combine(
             // indexed by global_expert_idx
             lane_id, token_idx - offset, d2h_channel_addrs,
             num_d2h_channel_addrs, true, low_latency_buffer_idx);
+#endif
       }
     }
 
@@ -1074,6 +1467,7 @@ __global__ __launch_bounds__(1024, 1) void combine(
         st_release_sys_global<kUseAggressiveAtomic>(
             reinterpret_cast<int*>(dst_p2p_ptr), 1);
       } else {
+#ifndef LL_COALESCE
         // Inter-node or no IPC: use IBGDA atomic
         // NOTE(MaoZiming): Without ibgda, we can only use atomic add
         // Pass offset to CPU proxy for atomic operation (similar to dispatch
@@ -1085,11 +1479,75 @@ __global__ __launch_bounds__(1024, 1) void combine(
             /*warp_id=*/global_expert_idx,  // NOTE(Yang): for selecting rb.
             false, d2h_channel_addrs, num_d2h_channel_addrs, true,
             low_latency_buffer_idx);
+#endif
+        // Coalesce: inter-node flag is posted per-dst-rank after the grid sync.
       }
       atomic_add_release_global<kUseAggressiveAtomic>(atomic_clean_flag, -1);
     }
     __syncwarp();
   }
+
+#ifdef LL_COALESCE
+  // Grid-wide sync so all combine staging is packed before the per-dst sends.
+  cg::this_grid().sync();
+
+  // One warp-group per destination rank (its local-expert-0 representative)
+  // issues a single large put of that rank's staged combine messages + one
+  // arrival flag. Intra-node destinations already delivered via IPC above.
+  if ((phases & LOW_LATENCY_SEND_PHASE) && responsible_expert_idx < num_experts &&
+      sub_warp_id == 0 && (responsible_expert_idx % num_local_experts) == 0) {
+    auto const dst_rank = responsible_expert_idx / num_local_experts;
+    auto const test_dst_ptr = reinterpret_cast<uint64_t>(combine_recv_stage);
+    auto const dst_p2p_ptr =
+        ipc_rdma_base_ptrs
+            ? uccl::get_ipc_p2p_ptr(test_dst_ptr, ipc_rdma_base_ptrs, rank,
+                                    dst_rank, max_nvl_peers, 0)
+            : 0;
+    if (dst_p2p_ptr == 0) {  // inter-node only
+      auto const n = combine_stage_count[dst_rank];
+      if (n > 0) {
+        auto const src_ptr = reinterpret_cast<uint64_t>(
+            static_cast<uint8_t*>(combine_send_stage) +
+            dst_rank * cmb_stage_bytes_per_rank);
+        auto const dst_ptr = reinterpret_cast<uint64_t>(
+            static_cast<uint8_t*>(combine_recv_stage) +
+            rank * cmb_stage_bytes_per_rank);
+        auto const total_bytes = static_cast<size_t>(n) * cmb_stage_entry_bytes;
+        __threadfence_system();
+        uccl::nvshmemi_ibgda_put_nbi_warp(
+            dst_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr),
+            src_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr), total_bytes,
+            dst_rank, /*expert_idx=*/dst_rank, lane_id, /*slot=*/0,
+            d2h_channel_addrs, num_d2h_channel_addrs, /*is_combine=*/false,
+            low_latency_buffer_idx, 0, 0, static_cast<int>(n));
+      }
+    }
+  }
+
+  __threadfence_system();  // ensure the coalesced put precedes the flag
+
+  if ((phases & LOW_LATENCY_SEND_PHASE) && responsible_expert_idx < num_experts &&
+      sub_warp_id == 0 && lane_id == 0 &&
+      (responsible_expert_idx % num_local_experts) == 0) {
+    auto const dst_rank = responsible_expert_idx / num_local_experts;
+    auto const test_dst_ptr = reinterpret_cast<uint64_t>(combine_recv_stage);
+    auto const dst_p2p_ptr =
+        ipc_rdma_base_ptrs
+            ? uccl::get_ipc_p2p_ptr(test_dst_ptr, ipc_rdma_base_ptrs, rank,
+                                    dst_rank, max_nvl_peers, 0)
+            : 0;
+    if (dst_p2p_ptr == 0) {  // inter-node: always post (even n==0)
+      auto const n = combine_stage_count[dst_rank];
+      auto const flag_dst =
+          reinterpret_cast<uint64_t>(combine_stage_flag_internode + rank);
+      uccl::nvshmemi_ibgda_amo_nonfetch_add(
+          flag_dst, reinterpret_cast<uint64_t>(atomic_buffer_ptr), -n - 1,
+          dst_rank, /*warp_id=*/dst_rank, false, d2h_channel_addrs,
+          num_d2h_channel_addrs, /*is_combine=*/false, low_latency_buffer_idx);
+      combine_stage_count[dst_rank] = 0;  // reset for next iteration
+    }
+  }
+#endif
 
 // Receiving phase
 LOW_LATENCY_COMBINE_RECV:
@@ -1098,6 +1556,58 @@ LOW_LATENCY_COMBINE_RECV:
     //   printf("[combine] SEND finished\n");
     return;
   }
+
+#ifdef LL_COALESCE
+  // R1: per-src-rank scatter from the coalesced combine recv staging back into
+  // the per-(expert,token) recv layout (rdma_recv_x[global_expert*maxtok+src_idx])
+  // that the weighted-sum recv-copy below consumes unchanged, then publish the
+  // per-expert arrival flags locally. One warp-group per inter source rank; the
+  // dst position is fully determined by the staged (global_expert, src_idx)
+  // header, so no slot assignment is needed. Intra sources arrived via IPC.
+  {
+    __shared__ int cmb_total[kNumMaxWarpGroups];
+    bool const is_rep = (responsible_expert_idx < num_experts) &&
+                        ((responsible_expert_idx % num_local_experts) == 0);
+    auto const csrc_rank = responsible_expert_idx / num_local_experts;
+    bool const is_inter =
+        is_rep && (csrc_rank / max_nvl_peers != rank / max_nvl_peers);
+    if (is_inter) {
+      auto const group_threads = num_warps_per_group * WARP_SIZE;
+      auto const group_tid = sub_warp_id * WARP_SIZE + lane_id;
+      if (sub_warp_id == 0 && lane_id == 0) {
+        int64_t v;
+        while ((v = static_cast<int64_t>(
+                    ld_acquire_sys_global<kUseAggressiveAtomic>(
+                        reinterpret_cast<uint64_t const*>(
+                            combine_stage_flag_internode + csrc_rank)))) == 0)
+          ;
+        cmb_total[warp_group_id] = static_cast<int>(-v - 1);
+      }
+      sync_barrier<true>(warp_group_id + 2, group_threads);
+      int const total = cmb_total[warp_group_id];
+      EP_DEVICE_ASSERT(total <= static_cast<int>(cmb_max_msgs_per_dst));
+      auto const src_base = static_cast<uint8_t*>(combine_recv_stage) +
+                            csrc_rank * cmb_stage_bytes_per_rank;
+      for (int t = sub_warp_id; t < total; t += num_warps_per_group) {
+        auto* entry = src_base + static_cast<size_t>(t) * cmb_stage_entry_bytes;
+        int const ge = reinterpret_cast<int const*>(entry)[0];
+        int const si = reinterpret_cast<int const*>(entry)[1];
+        auto* dst_u8 =
+            static_cast<uint8_t*>(rdma_recv_x) +
+            (static_cast<size_t>(ge) * num_max_dispatch_tokens_per_rank + si) *
+                num_bytes_per_slot;
+        if (lane_id == 0) *reinterpret_cast<int*>(dst_u8) = t;
+      }
+      sync_barrier<true>(warp_group_id + 2, group_threads);
+      // Publish this source rank's per-expert arrival flags.
+      for (int le = group_tid; le < num_local_experts; le += group_threads)
+        rdma_recv_flag_internode[csrc_rank * num_local_experts + le] = 1;
+    }
+  }
+  // All scatters + flag writes complete before the per-expert wait / recv-copy.
+  cg::this_grid().sync();
+#endif
+
   // Wait all ranks to arrive
   if (responsible_expert_idx < num_experts) {
     EP_DEVICE_ASSERT(num_warps_per_group > 1);
@@ -1189,6 +1699,16 @@ LOW_LATENCY_COMBINE_RECV:
                   num_bytes_per_slot);
           auto rdma_buffer_row =
               reinterpret_cast<uint8_t const*>(rdma_buffer_type);
+#ifdef LL_COALESCE
+          int const expert_rank = reg_topk_idx[i] / num_local_experts;
+          if (expert_rank / max_nvl_peers != rank / max_nvl_peers) {
+            int const staged_index = ld_nc_global(rdma_buffer_type);
+            rdma_buffer_row = static_cast<uint8_t const*>(combine_recv_stage) +
+                expert_rank * cmb_stage_bytes_per_rank +
+                static_cast<size_t>(staged_index) * cmb_stage_entry_bytes +
+                sizeof(int4);
+          }
+#endif
 
           // Reduce
           auto x_vec = ld_nc_global(
@@ -1228,8 +1748,16 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              int num_d2h_channel_addrs, int max_nvl_peers,
              int low_latency_buffer_idx, void** ipc_rdma_base_ptrs,
              void* rdma_buffer_ptr, void* atomic_buffer_ptr,
-             int64_t* rdma_recv_flag_internode) {
+             int64_t* rdma_recv_flag_internode, void* combine_send_stage,
+             void* combine_recv_stage, int64_t* combine_stage_flag_internode) {
   constexpr int kNumMaxTopk = 16;
+#ifdef LL_COALESCE
+  EP_HOST_ASSERT(num_topk <= 8 &&
+                 "LL_COALESCE staging assumes num_topk <= 8");
+  EP_HOST_ASSERT(combine_send_stage != nullptr &&
+                 combine_recv_stage != nullptr &&
+                 combine_stage_flag_internode != nullptr);
+#endif
   int const num_warp_groups = ceil_div(num_experts, num_device_sms);
   int const num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
   EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0);
@@ -1239,7 +1767,15 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
 
   // Check workspace
   auto atomic_clean_flag = static_cast<int*>(workspace);
+#ifdef LL_COALESCE
+  // Reuse the workspace: [atomic_clean_flag][combine_stage_count[num_ranks]][barrier]
+  auto combine_stage_count = atomic_clean_flag + 1;
+  auto grid_sync_barrier_ptr = combine_stage_count + num_ranks;
+  EP_HOST_ASSERT((num_ranks + 2) * sizeof(int) <= NUM_WORKSPACE_BYTES);
+#else
+  int* combine_stage_count = nullptr;
   auto grid_sync_barrier_ptr = atomic_clean_flag + 1;
+#endif
   EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
   EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
 
@@ -1297,7 +1833,9 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
         num_ranks, num_warp_groups, num_warps_per_group_launch, phases,      \
         zero_copy, d2h_channel_addrs, num_d2h_channel_addrs, max_nvl_peers,  \
         low_latency_buffer_idx, ipc_rdma_base_ptrs, rdma_buffer_ptr,         \
-        atomic_buffer_ptr, rdma_recv_flag_internode, grid_sync_barrier_ptr); \
+        atomic_buffer_ptr, rdma_recv_flag_internode, combine_send_stage,     \
+        combine_recv_stage, combine_stage_flag_internode, combine_stage_count, \
+        grid_sync_barrier_ptr);                                              \
   }                                                                          \
   break
 

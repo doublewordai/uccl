@@ -28,7 +28,13 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               void** ipc_rdma_base_ptrs = nullptr,
               void* rdma_buffer_ptr = nullptr,
               void* atomic_buffer_ptr = nullptr,
-              int64_t* rdma_recv_count_internode = nullptr);
+              int64_t* rdma_recv_count_internode = nullptr,
+              // Coalesced dispatch staging (unused unless
+              // LL_COALESCE is compiled in).
+              void* rdma_x_stage = nullptr, void* recv_stage = nullptr,
+              int64_t* stage_flag_internode = nullptr,
+              void** ipc_nvl_base_ptrs = nullptr,
+              size_t node_control_offset = 0);
 
 void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              void* rdma_send_x, void const* x, int64_t const* topk_idx,
@@ -43,6 +49,11 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              int num_d2h_channel_addrs, int max_nvl_peers,
              int low_latency_buffer_idx, void** ipc_rdma_base_ptrs = nullptr,
              void* rdma_buffer_ptr = nullptr, void* atomic_buffer_ptr = nullptr,
-             int64_t* rdma_recv_flag_internode = nullptr);
+             int64_t* rdma_recv_flag_internode = nullptr,
+             // Coalesced combine staging (unused unless
+             // LL_COALESCE is compiled in).
+             void* combine_send_stage = nullptr,
+             void* combine_recv_stage = nullptr,
+             int64_t* combine_stage_flag_internode = nullptr);
 }  // namespace internode_ll
 }  // namespace uccl
