@@ -212,7 +212,14 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
           // Calculate local amax
           auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
           float fp32_values[kNumElemsPerRead];
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+          // Without scale rounding, match the reference per-token-group
+          // quantizer bit for bit: its amax floor and correctly rounded
+          // divisions (a multiply by the reciprocal can differ in the last bit).
+          float amax = round_scale ? kFP8Margin : 1e-10f, scale, scale_inv;
+#else
           float amax = kFP8Margin, scale, scale_inv;
+#endif
 #pragma unroll
           for (int j = 0; j < kNumElemsPerRead; ++j) {
             fp32_values[j] = static_cast<float>(bf16_values[j]);
@@ -226,12 +233,18 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
                            "Invalid vectorization");
           amax = warp_reduce_max<16>(amax);
           calculate_fp8_scales(amax, scale, scale_inv, round_scale);
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+          if (!round_scale) scale_inv = __fdiv_rn(amax, 448.0f);
+#endif
           if (lane_id % 16 == 0)
 #else
           EP_STATIC_ASSERT(kNumElemsPerRead * WARP_SIZE / kNumPerChannels == 2,
                            "Invalid vectorization");
           amax = warp_reduce_max<16>(amax);
           calculate_fp8_scales(amax, scale, scale_inv, round_scale);
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+          if (!round_scale) scale_inv = __fdiv_rn(amax, 448.0f);
+#endif
           if (lane_id == 0 or lane_id == 16)
 #endif
             rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
@@ -242,8 +255,17 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
               reinterpret_cast<__nv_fp8x2_storage_t*>(&int2_value);
 #pragma unroll
           for (int j = 0; j < kNumElemsPerRead; j += 2) {
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+            // Rounded scales are powers of two, so the multiply is exact.
+            float2 fp32x2 =
+                round_scale
+                    ? float2{fp32_values[j] * scale, fp32_values[j + 1] * scale}
+                    : float2{__fdiv_rn(fp32_values[j], scale_inv),
+                             __fdiv_rn(fp32_values[j + 1], scale_inv)};
+#else
             float2 fp32x2 = {fp32_values[j] * scale,
                              fp32_values[j + 1] * scale};
+#endif
             fp8x2_values[j / 2] =
                 __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE,
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
