@@ -126,6 +126,7 @@ Notes:
 * For Broadcom Thor-2, we suggest setting `UCCL_IB_MAX_INFLIGHT_BYTES=1572864 UCCL_IB_MAX_INFLIGHT_NORMAL=1` to enforce strict flow control, avoiding CQE error 12 (Transport Retry Counter Exceeded).
 * For AMD Pollara AI NIC, we suggest setting `UCCL_IB_MAX_INFLIGHT_BYTES=2097152 UCCL_IB_MAX_INFLIGHT_NORMAL=1`. 
 * Please refer to [bench/baseline](bench/baseline) for running more baselines including Torch, NVSHMEM, and pplx-kernels on EFA. 
+* On HPE Slingshot / CXI with the libfabric provider, set `FI_MR_CACHE_MONITOR=userfaultfd`. libfabric's default `memhooks` memory-registration cache monitor intercepts the process allocator's `mmap`/`munmap`/`brk`; when GPU buffers are registered this reenters against CUDA's caching device allocator and deadlocks (observed as a hang inside a CUDA allocation, with the UCCL proxy threads idle). The `userfaultfd` monitor watches page faults instead and avoids the reentrancy. Set it in the environment before the first RDMA registration.
 
 | Environment Variable | Description | Default Value |
 |---------------------|-------------|---------------|
@@ -138,6 +139,7 @@ Notes:
 | UCCL_IB_TC | Traffic class in RDMA network | 104/0 (IB/EFA) |
 | UCCL_EP_ENABLE_AGGRESSIVE_ATOMIC | Use relaxed atomics with manual `s_waitcnt vmcnt(0)` fences instead of acquire/release semantics. Required on AMD CDNA so the combine receiver actually sees the producer's tail-pointer updates over XGMI; without it the kernel deadlocks at scale. | 1 on AMD, 0 on CUDA |
 | UCCL_RDMA_ADAPTIVE_SLEEP | Enable adaptive sleeping on proxy threads, by putting the proxy threads into a sleeping state if there have been no new work requests / RDMA completion events after 120s. | null |
+| FI_MR_CACHE_MONITOR | libfabric memory-registration cache monitor (a libfabric variable, not a UCCL one). Set to `userfaultfd` on Slingshot/CXI: the default `memhooks` monitor deadlocks against CUDA's caching device allocator when GPU memory is registered. | memhooks (libfabric default) |
 
 ## Results
 
